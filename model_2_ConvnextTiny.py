@@ -61,6 +61,7 @@ class InferenceConfig:
     ])
 
     # All 5 targets required for submission
+    # 全部的5个目标都要预测
     all_target_cols: list[str] = field(default_factory=lambda: [
         'Dry_Green_g', 'Dry_Dead_g', 'Dry_Clover_g', 'GDM_g', 'Dry_Total_g'
     ])
@@ -86,6 +87,7 @@ class InferenceConfig:
 
 # ============================================================================
 # TTA (Test-Time Augmentation) Transforms
+# 测试时增强
 # ============================================================================
 
 class TTATransformFactory:
@@ -141,6 +143,7 @@ class TTATransformFactory:
             *self.base_transforms
         ])
 
+        # 返回3个增强后的图像：原始、水平翻转、垂直翻转
         return [original, hflip, vflip]
 
 
@@ -150,10 +153,11 @@ class TTATransformFactory:
 
 class TestBiomassDataset(Dataset):
     """
-    Two-stream dataset for testing.
-
+    Two-stream dataset for testing. 
+    # 两个流：左图和右图
     Accepts a specific transform pipeline for TTA and applies
     the same augmentation to both left and right images.
+    # 接受一个特定的增强管道用于TTA，并应用相同的增强到左右两张图像
 
     Returns:
         tuple: (img_left, img_right) (left image tensor, right image tensor)
@@ -196,21 +200,26 @@ class TestBiomassDataset(Dataset):
         full_path = self.image_dir / Path(img_path).name
 
         # Load image (return black image on error)
+        # 加载图像，如果失败则返回黑色图像
         image = cv2.imread(str(full_path))
 
         if image is None:
             print(f"Warning: Failed to load image: {full_path} -> Returning black image")
+            # 图像尺寸：宽度2000，高度1000，3个通道（RGB）
             image = np.zeros((1000, 2000, 3), dtype=np.uint8)
 
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB) # Convert from OpenCV (BGR) to RGB
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB) # 将图像从BGR格式转换为RGB格式
 
         # Split into left and right
+        # 将图像分割为左图和右图
         height, width = image.shape[:2]
         mid_point = width // 2
         img_left = image[:, :mid_point]
         img_right = image[:, mid_point:]
+        # 左图和右图的尺寸：宽度1000，高度1000，3个通道（RGB）
 
         # Apply same transform to both
+        # 应用相同的增强到左右两张图像
         img_left_tensor = self.transform(image=img_left)['image']
         img_right_tensor = self.transform(image=img_right)['image']
 
@@ -224,6 +233,7 @@ class TestBiomassDataset(Dataset):
 class BiomassModel(nn.Module):
     """
     Two-stream, three-head regression model.
+    # 双流，三个回归头模型
 
     Uses the exact same architecture as during training.
     """
@@ -240,12 +250,12 @@ class BiomassModel(nn.Module):
         self.backbone = timm.create_model(
             model_name,
             pretrained=pretrained,
-            num_classes=0,       # Classifier layer is not needed
-            global_pool='avg'    # Use GAP (Global Average Pooling)
+            num_classes=0,       # Classifier layer is not needed 不需要分类器层
+            global_pool='avg'    # Use GAP (Global Average Pooling) 使用全局平均池化
         )
 
         self.n_features = self.backbone.num_features # Number of output features from the backbone
-        self.n_combined = self.n_features * 2        # Number of features after concatenating left and right streams
+        self.n_combined = self.n_features * 2        # Number of features after concatenating left and right streams 连接左图和右图后的特征数量
 
         # Dedicated prediction heads for each of the three targets
         self.head_total = self._create_head() # Head for Dry_Total_g
@@ -254,11 +264,12 @@ class BiomassModel(nn.Module):
 
     def _create_head(self) -> nn.Sequential:
         """Helper function to generate the MLP structure for a single head"""
+        # 创建线性层、ReLU激活函数、Dropout层和输出层
         return nn.Sequential(
             nn.Linear(self.n_combined, self.n_combined // 2),
             nn.ReLU(),
             nn.Dropout(0.3),
-            nn.Linear(self.n_combined // 2, 1) # Output is a single continuous value
+            nn.Linear(self.n_combined // 2, 1) # Output is a single continuous value 输出是一个连续值
         )
 
     def forward(
@@ -281,6 +292,7 @@ class BiomassModel(nn.Module):
         combined = torch.cat([feat_left, feat_right], dim=1) # Concatenate features
 
         # Calculate predictions with each head
+        # 计算每个目标的预测值
         out_total = self.head_total(combined)
         out_gdm = self.head_gdm(combined)
         out_green = self.head_green(combined)
@@ -333,6 +345,7 @@ class ModelLoader:
             state_dict = torch.load(model_path, map_location=self.config.device)
 
             # Remove 'module.' prefix from DataParallel
+            # 移除'module.'前缀
             state_dict = self._remove_dataparallel_prefix(state_dict)
 
             model.load_state_dict(state_dict)
@@ -378,6 +391,7 @@ class ModelLoader:
 class InferenceEngine:
     """
     Engine for executing TTA + Ensemble inference.
+    TTA + 集成推理引擎
     """
 
     def __init__(
@@ -417,21 +431,26 @@ class InferenceEngine:
                 fold_preds = {'total': [], 'gdm': [], 'green': []}
 
                 for model in self.models:
+                    # 预测每个目标的值
                     pred_total, pred_gdm, pred_green = model(img_left, img_right)
+                    # 收集5个fold的预测值
                     fold_preds['total'].append(pred_total.cpu())
                     fold_preds['gdm'].append(pred_gdm.cpu())
                     fold_preds['green'].append(pred_green.cpu())
 
                 # Average predictions across 5 folds
+                # 平均5个fold的预测值
                 avg_total = torch.mean(torch.stack(fold_preds['total']), dim=0)
                 avg_gdm = torch.mean(torch.stack(fold_preds['gdm']), dim=0)
                 avg_green = torch.mean(torch.stack(fold_preds['green']), dim=0)
 
+                # 将平均后的预测值添加到view_preds中
                 view_preds['total'].append(avg_total.numpy())
                 view_preds['gdm'].append(avg_gdm.numpy())
                 view_preds['green'].append(avg_green.numpy())
 
         # Concatenate results from all batches
+        # 将所有批次的预测结果连接起来
         return {
             k: np.concatenate(v).flatten()
             for k, v in view_preds.items()
@@ -460,6 +479,7 @@ class InferenceEngine:
             print(f"--- TTA View {i+1}/{len(tta_transforms)} ---")
 
             # Create a dedicated Dataset and DataLoader for this view
+            # 创建一个专门用于这个视图的Dataset和DataLoader
             dataset = TestBiomassDataset(
                 test_df,
                 transform,
@@ -481,6 +501,7 @@ class InferenceEngine:
             print(f"  ✓ View {i+1} completed")
 
         # TTA Ensemble (average across all views)
+        # 计算TTA Ensemble（平均所有视图）
         print("\nCalculating TTA Ensemble (averaging all views)...")
         final_preds = {
             'total': np.mean([p['total'] for p in all_view_preds], axis=0),
@@ -537,10 +558,12 @@ class SubmissionCreator:
         pred_green = predictions['green']
 
         # 2. Calculate the remaining 2 targets using relationships (clip negative values to 0)
+        # 计算剩余2个目标的值（将负值截断为0）
         pred_clover = np.maximum(0, pred_gdm - pred_green)
         pred_dead = np.maximum(0, pred_total - pred_gdm)
 
         # 3. Create a wide-format DataFrame
+        # 创建一个宽格式DataFrame
         preds_wide = pd.DataFrame({
             'image_path': test_df_unique['image_path'],
             'Dry_Green_g': pred_green,
@@ -551,6 +574,7 @@ class SubmissionCreator:
         })
 
         # 4. Convert to long format (unpivot)
+        # 将宽格式转换为长格式
         preds_long = preds_wide.melt(
             id_vars=['image_path'],
             value_vars=self.config.all_target_cols,
@@ -559,6 +583,7 @@ class SubmissionCreator:
         )
 
         # 5. Merge with the original test.csv to get sample_id
+        # 将原始test.csv和预测结果合并
         submission = pd.merge(
             test_df_long[['sample_id', 'image_path', 'target_name']],
             preds_long,

@@ -48,6 +48,7 @@ labels = [
 print("Loading SigLIP model...")
 # Load the pretrained SigLIP model
 # SigLIP is a Vision-Language model capable of extracting high-quality feature vectors from images.
+# SigLIP模型：SO-400M-Patch14-384 是视觉语言模型
 model_name = "/kaggle/input/google-siglip-so400m-patch14-384/transformers/default/1/"
 model = AutoModel.from_pretrained(
     model_name,
@@ -92,6 +93,7 @@ df_test = (
 )
 
 # --- 1.4. Extract Image Features with SigLIP ---
+# 提取图像特征，保存到{save_path}.ndjson文件中
 def compute_features(images: list, save_path: str):
     """Function to take a list of images, compute features with the SigLIP model, and save them to an ndjson file."""
     batch_size = 20
@@ -99,8 +101,11 @@ def compute_features(images: list, save_path: str):
         for i in tqdm(range(0, len(images), batch_size), desc=f"Extracting {save_path}"):
             batch_paths = images[i:i + batch_size]
             batch = [Image.open(data_path / p) for p in batch_paths]
+            # 将图像转换为模型可以理解的格式
             inputs = processor(images=batch, return_tensors="pt").to(model.device)
+            # 提取图像特征
             features = model.get_image_features(**inputs)
+            # 将特征转换为字典格式，并保存到.ndjson文件中
             for line in features:
                 data = {f'x_{j}': line[j].item() for j in range(len(line))}
                 f.write(json.dumps(data) + '\n')
@@ -110,9 +115,13 @@ compute_features(df_test['image_path'], 'features_test.ndjson')
 print("Feature extraction complete.")
 
 # --- 1.5. Combine Features with Original Data ---
+# 读取图像特征，保存到responses和responses_test中
 responses = pl.read_ndjson('features.ndjson')
+# 读取测试图像特征，保存到responses_test中
 responses_test = pl.read_ndjson('features_test.ndjson')
+# 将图像特征与原始数据合并
 df_aug = pl.concat([df, responses], how='horizontal')
+# 将测试图像特征与原始数据合并
 df_test_aug = pl.concat([df_test, responses_test], how='horizontal')
 
 # ==============================================================================
@@ -152,6 +161,7 @@ def cross_validate(model, data, data_test, x_columns, random_state=42) -> tuple:
     y_pred_test = np.zeros([len(X_test), len(labels)])
 
     n_splits = 5
+    np.random.seed(random_state)
     kf = GroupKFold(n_splits=n_splits)
     groups = data.select('group')
 
@@ -186,6 +196,7 @@ oof_pred_gb, pred_test_gb = cross_validate(
     subsample=0.8,
     random_state=42
 ), df_aug, df_test_aug, feature_columns)
+
 # --- [Comparison] LightGBM Regressor (GPU) ---
 print("\n--- [Comparison] LightGBM Regressor (GPU) ---")
 from lightgbm import LGBMRegressor

@@ -34,6 +34,9 @@ class CFG:
         OUTPUT_DIR = "/kaggle/working"
 
     else:
+        os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+        os.environ['TIMM_MODEL_HUB'] = 'https://hf-mirror.com'
+
         DATA_ROOT = "./datasets/csiro-biomass"
 
         MODEL_WEIGHTS_PATH = "facebook/dinov2-giant"
@@ -94,7 +97,7 @@ class BiomassDataset(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         img_path = row['image_path']
-        image = Image.open(f'/datasets/csiro-biomass/{row["image_path"]}').convert('RGB')
+        image = Image.open(f'{CFG.DATA_ROOT}/{row["image_path"]}').convert('RGB')
         if self.transforms:
             image = self.transforms(image)
         targets = torch.tensor([

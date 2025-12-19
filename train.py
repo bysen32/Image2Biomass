@@ -4,6 +4,7 @@ import torch
 import warnings
 import timm
 import torch.nn as nn
+import os
 import pytorch_lightning as pl
 
 
@@ -13,8 +14,39 @@ import torchvision.transforms as T
 import pandas as pd
 from sklearn.model_selection import KFold
 from pytorch_lightning.callbacks import ModelCheckpoint
+from transformers import AutoModel, AutoProcessor
 
 warnings.filterwarnings('ignore')
+
+
+class CFG:
+    IS_KAGGLE = 'KAGGLE_KERNEL_RUN_TYPE' in os.environ
+    
+    SEED = 42
+
+    if IS_KAGGLE:
+        DATA_ROOT = "/kaggle/input/csiro-biomass"
+
+        # Kaggle 离线模式下，模型通常存放在 input 目录下
+        MODEL_WEIGHTS_PATH = "/kaggle/input/dinov2/pytorch/giant/1"
+        DEVICES = 2
+
+        OUTPUT_DIR = "/kaggle/working"
+
+    else:
+        DATA_ROOT = "./datasets/csiro-biomass"
+
+        MODEL_WEIGHTS_PATH = "facebook/dinov2-giant"
+        DEVICES = 1
+
+        OUTPUT_DIR = "./outputs"
+
+        # if not os.path.exists(MODEL_WEIGHTS_PATH):
+        #     os.makedirs(MODEL_WEIGHTS_PATH, exist_ok=True)
+        if not os.path.exists(OUTPUT_DIR):
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def seed_everything(seed: int=42):
@@ -62,7 +94,7 @@ class BiomassDataset(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         img_path = row['image_path']
-        image = Image.open(f'/datasets/{row["image_path"]}').convert('RGB')
+        image = Image.open(f'/datasets/csiro-biomass/{row["image_path"]}').convert('RGB')
         if self.transforms:
             image = self.transforms(image)
         targets = torch.tensor([
@@ -76,28 +108,31 @@ class BiomassDataset(Dataset):
 
 
 class MultiRegressionModel(pl.LightningModule):
-    def __init__(self, model_name='efficientnet_b0', pretrained=True, lr=1e-4, output_dim=5):
+    def __init__(self, lr=1e-4):
         super().__init__()
         self.save_hyperparameters()
-        self.model = timm.create_model(model_name, pretrained=pretrained, num_classes=output_dim)
+        self.model = AutoModel.from_pretrained(CFG.MODEL_WEIGHTS_PATH)
+        self.head = nn.Linear(1024, 5)
         self.criterion = nn.SmoothL1Loss()
         self.val_outputs = []
 
     def forward(self, x):
-        return self.model(x) # shape: (N, 5)
+        x = self.model(x).pooler_output # shape: (N, 1024)
+        x = self.head(x) # shape: (N, 5)
+        return x # shape: (N, 5)
     
     def training_step(self, batch, batch_idx):
         x, y = batch
-        y_preds = self(x)
-        loss = self.criterion(y_preds, y)
-        self.log('train_loss', loss, on_setp=False, on_epoch=True)
+        y_pred = self(x)
+        loss = self.criterion(y_pred, y)
+        self.log('train_loss', loss, on_step=False, on_epoch=True)
         return loss
     
     def validation_step(self, batch, batch_idx):
         x, y = batch
-        y_preds = self(x)
-        loss = self.criterion(y_preds, y)
-        self.val_outputs.append((y_preds.detach().cpu(), y.detach().cpu()))
+        y_pred = self(x)
+        loss = self.criterion(y_pred, y)
+        self.val_outputs.append((y_pred.detach().cpu(), y.detach().cpu()))
         self.log("val_loss", loss, on_step=False, on_epoch=True)
         return loss
     
@@ -109,10 +144,10 @@ class MultiRegressionModel(pl.LightningModule):
             self.val_outputs.clear()
             return
         
-        y_preds, y_true = zip(*self.val_outputs)
-        y_preds = torch.cat(y_preds).numpy()
+        y_pred, y_true = zip(*self.val_outputs)
+        y_pred = torch.cat(y_pred).numpy()
         y_true = torch.cat(y_true).numpy()
-        weighted_r2, r2_scores = weighted_r2_score(y_true, y_preds)
+        weighted_r2, r2_scores = weighted_r2_score(y_true, y_pred)
         self.log("val_weighted_r2", weighted_r2, prog_bar=True, on_epoch=True)
         for i, name in enumerate(["Dry_Green_g", "Dry_Dead_g", "Dry_Clover_g", "GDM_g", "Dry_Total_g"]):
             self.log(f"val_r2_{name}", r2_scores[i], on_epoch=True)
@@ -163,16 +198,15 @@ class ImageRegressionDataModule(pl.LightningDataModule):
 
 
 
-# train_df = pd.read_csv('/kaggle/input/csiro-biomass/train.csv')
-train_df = pd.read_csv('/datasets/train.csv')
+train_df = pd.read_csv(f'{CFG.DATA_ROOT}/train.csv')
 train_df = pd.pivot_table(train_df, index='image_path', columns=['target_name'], values='target').reset_index()
 
-kf = KFold(n_splits=5, shuffle=True, random_state=42)
+kf = KFold(n_splits=5, shuffle=True, random_state=CFG.SEED)
 
 for fold, (train_idxs, val_idxs) in enumerate(kf.split(train_df)):
-    seed_everything(42)
+    seed_everything(CFG.SEED)
     datamodule = ImageRegressionDataModule(train_df.iloc[train_idxs], train_df.iloc[val_idxs])
-    model = MultiRegressionModel(model_name='efficientnet_b0', pretrained=True, lr=1e-4)
+    model = MultiRegressionModel(lr=1e-4)
 
     checkpoint_callback = ModelCheckpoint(
         monitor='val_weighted_r2',
@@ -183,6 +217,7 @@ for fold, (train_idxs, val_idxs) in enumerate(kf.split(train_df)):
 
     trainer = pl.Trainer(
         max_epochs=10,
+        devices=CFG.DEVICES,
         accelerator='gpu' if torch.cuda.is_available() else 'cpu',
         callbacks=[checkpoint_callback],
         precision='16-mixed',

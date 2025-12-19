@@ -208,3 +208,5 @@ __marimo__/
 
 # logs
 lightning_logs/
+datasets/
+*.pth

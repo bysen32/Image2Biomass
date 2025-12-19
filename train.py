@@ -208,7 +208,7 @@ kf = KFold(n_splits=5, shuffle=True, random_state=CFG.SEED)
 
 for fold, (train_idxs, val_idxs) in enumerate(kf.split(train_df)):
     seed_everything(CFG.SEED)
-    datamodule = ImageRegressionDataModule(train_df.iloc[train_idxs], train_df.iloc[val_idxs])
+    datamodule = ImageRegressionDataModule(train_df.iloc[train_idxs], train_df.iloc[val_idxs], batch_size=1)
     model = MultiRegressionModel(lr=1e-4)
 
     checkpoint_callback = ModelCheckpoint(

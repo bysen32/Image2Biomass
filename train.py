@@ -6,6 +6,7 @@ import timm
 import torch.nn as nn
 import os
 import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint
 
 
 from torch.utils.data import Dataset, DataLoader
@@ -13,8 +14,8 @@ from PIL import Image
 import torchvision.transforms as T
 import pandas as pd
 from sklearn.model_selection import KFold
-from pytorch_lightning.callbacks import ModelCheckpoint
 from transformers import AutoModel, AutoProcessor
+from peft import LoraConfig, get_peft_model
 
 warnings.filterwarnings('ignore')
 
@@ -24,23 +25,32 @@ class CFG:
     
     SEED = 42
 
+    # 图像尺寸：DINOv2 支持任意尺寸，但Giant建议先用224跑通，显存够再上518
+    IMAGE_SIZE = 224
+    BATCH_SIZE = 8
+    ACCUMULATE_GRAD = 4
+    LR = 2e-4
+    EPOCHS = 10
+    NUM_WORKERS = 4
+    # LoRA 参数
+    LORA_R = 16
+    LORA_ALPHA = 32
+    LORA_DROPOUT = 0.05
+
     if IS_KAGGLE:
         DATA_ROOT = "/kaggle/input/csiro-biomass"
 
         # Kaggle 离线模式下，模型通常存放在 input 目录下
         MODEL_WEIGHTS_PATH = "/kaggle/input/dinov2/pytorch/giant/1"
-        DEVICES = 2
+        NUM_DEVICES = 2
 
         OUTPUT_DIR = "/kaggle/working"
 
     else:
-        os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
-        os.environ['TIMM_MODEL_HUB'] = 'https://hf-mirror.com'
-
         DATA_ROOT = "./datasets/csiro-biomass"
 
         MODEL_WEIGHTS_PATH = "facebook/dinov2-giant"
-        DEVICES = 1
+        NUM_DEVICES = 1
 
         OUTPUT_DIR = "./outputs"
 
@@ -114,15 +124,43 @@ class MultiRegressionModel(pl.LightningModule):
     def __init__(self, lr=1e-4):
         super().__init__()
         self.save_hyperparameters()
-        self.model = AutoModel.from_pretrained(CFG.MODEL_WEIGHTS_PATH)
-        self.head = nn.Linear(self.model.config.hidden_size, 5) # 5 is the number of targets
+        self.backbone = AutoModel.from_pretrained(CFG.MODEL_WEIGHTS_PATH)
+
+        # 开启 gradient checkpointing
+        self.backbone.gradient_checkpointing_enable()
+
+        # 集成LoRA（只训练0.1%的参数）
+        peft_config = LoraConfig(
+            r=CFG.LORA_R,
+            lora_alpha=CFG.LORA_ALPHA,
+            lora_dropout=CFG.LORA_DROPOUT,
+            target_modules=["query", "value", "key", "dense"],
+            lora_dropout=CFG.LORA_DROPOUT,
+            bias="none",
+            modules_to_save=[], # 如果有特定层想全量训练放在这里
+        )
+        self.backbone = get_peft_model(self.backbone, peft_config)
+        self.backbone.print_trainable_parameters() # 打印可训练参数量
+        
+        # 回归头 (Regression Head)
+        self.hidden_size = self.backbone.config.hidden_size
+        self.head = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(self.hidden_size // 2, 5),
+        )
         self.criterion = nn.SmoothL1Loss()
         self.val_outputs = []
 
     def forward(self, x):
-        x = self.model(x).pooler_output # shape: (N, hidden_size)
-        x = self.head(x) # shape: (N, 5)
-        return x # shape: (N, 5)
+        outputs = self.backbone(x) # shape: (N, hidden_size)
+
+        # 获取 CLS token （DINOv2 的特征表达）
+        # last_hidden_state shape: [N, Seq_Len, Hidden_Size]
+        cls_token = outputs.last_hidden_state[:, 0, :] # shape: [N, Hidden_Size]
+        logits = self.head(cls_token) # shape: (N, 5)
+        return logits
     
     def training_step(self, batch, batch_idx):
         x, y = batch
@@ -158,8 +196,13 @@ class MultiRegressionModel(pl.LightningModule):
         return
     
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
+        # 只需要优化 LoRA 参数 和 Head 参数
+        optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, self.parameters()), lr=self.hparams.lr)
+
+        # 学习率调度器
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=CFG.EPOCHS, eta_min=1e-6)
+        
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
 
@@ -209,7 +252,7 @@ kf = KFold(n_splits=5, shuffle=True, random_state=CFG.SEED)
 for fold, (train_idxs, val_idxs) in enumerate(kf.split(train_df)):
     seed_everything(CFG.SEED)
     datamodule = ImageRegressionDataModule(train_df.iloc[train_idxs], train_df.iloc[val_idxs], batch_size=1)
-    model = MultiRegressionModel(lr=1e-4)
+    model = MultiRegressionModel(lr=CFG.LR)
 
     checkpoint_callback = ModelCheckpoint(
         monitor='val_weighted_r2',
@@ -219,13 +262,13 @@ for fold, (train_idxs, val_idxs) in enumerate(kf.split(train_df)):
     )
 
     trainer = pl.Trainer(
-        max_epochs=10,
-        devices=CFG.DEVICES,
+        max_epochs=CFG.EPOCHS,
+        devices=CFG.NUM_DEVICES,
         accelerator='gpu' if torch.cuda.is_available() else 'cpu',
         callbacks=[checkpoint_callback],
         precision='16-mixed',
     )
 
     trainer.fit(model, datamodule=datamodule)
-    torch.save(model.state_dict(), f'best_model_fold{fold}.pth')
+    torch.save(model.state_dict(), f'{CFG.OUTPUT_DIR}/best_model_fold{fold}.pth')
 

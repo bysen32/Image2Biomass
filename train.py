@@ -120,6 +120,7 @@ class MultiRegressionModel(pl.LightningModule):
         self.val_outputs = []
 
     def forward(self, x):
+        breakpoint()
         x = self.model(x).pooler_output # shape: (N, 1024)
         x = self.head(x) # shape: (N, 5)
         return x # shape: (N, 5)

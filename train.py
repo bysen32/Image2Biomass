@@ -115,13 +115,12 @@ class MultiRegressionModel(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
         self.model = AutoModel.from_pretrained(CFG.MODEL_WEIGHTS_PATH)
-        self.head = nn.Linear(1024, 5)
+        self.head = nn.Linear(self.model.config.hidden_size, 5) # 5 is the number of targets
         self.criterion = nn.SmoothL1Loss()
         self.val_outputs = []
 
     def forward(self, x):
-        breakpoint()
-        x = self.model(x).pooler_output # shape: (N, 1024)
+        x = self.model(x).pooler_output # shape: (N, hidden_size)
         x = self.head(x) # shape: (N, 5)
         return x # shape: (N, 5)
     

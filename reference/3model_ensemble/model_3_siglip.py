@@ -47,8 +47,9 @@ labels = [
 # --- 1.1. Load SigLIP Model ---
 print("Loading SigLIP model...")
 # Load the pretrained SigLIP model
+# 加载预训练 SigLIP 模型
 # SigLIP is a Vision-Language model capable of extracting high-quality feature vectors from images.
-# SigLIP模型：SO-400M-Patch14-384 是视觉语言模型
+# SigLIP模型：SO-400M-Patch14-384 是视觉语言模型, 从图像中提取高质量特征
 model_name = "/kaggle/input/google-siglip-so400m-patch14-384/transformers/default/1/"
 model = AutoModel.from_pretrained(
     model_name,
@@ -57,6 +58,7 @@ model = model.to(device)  # Move the model to the GPU
 model.eval()              # Set the model to evaluation mode (disables gradient calculation)
 
 # Load the corresponding image processor (for preprocessing)
+# 加载图像处理器，用于预处理图像
 processor = AutoImageProcessor.from_pretrained(model_name)
 print("Model loading complete.")
 
@@ -73,12 +75,8 @@ df = (
     # Group by image_path
     .group_by('image_path')
     # Calculate the mean for each label and create a group key for GroupKFold
-    .agg([
-        pl.col(label).mean()
-        for label in labels
-    ] + [
-        pl.concat_str(["Sampling_Date", "State"], separator=" ").alias("group").first()
-    ])
+    .agg([pl.col(label).mean() for label in labels] + 
+         [pl.concat_str(["Sampling_Date", "State"], separator=" ").alias("group").first()])
     .sort('image_path') # Sort by image_path
 )
 
@@ -86,9 +84,7 @@ df = (
 print("Processing test data...")
 test = pl.read_csv(data_path / 'test.csv')
 df_test = (
-    test
-    .group_by('image_path')
-    .len() # Get the number of targets for each image (5 in this case)
+    test.group_by('image_path').len() # Get the number of targets for each image (5 in this case)
     .sort('image_path')
 )
 
@@ -200,6 +196,7 @@ oof_pred_gb, pred_test_gb = cross_validate(
 # --- [Comparison] LightGBM Regressor (GPU) ---
 print("\n--- [Comparison] LightGBM Regressor (GPU) ---")
 from lightgbm import LGBMRegressor
+
 cross_validate(
     LGBMRegressor(
         device="gpu",              # ✅ GPU
@@ -283,8 +280,7 @@ pred_with_id = pl.concat([
 
 # --- Format for submission ---
 pred_save = (
-    test
-    .join(pred_with_id, on='image_path')
+    test.join(pred_with_id, on='image_path')
     .with_columns(
         pl.coalesce(*[  
             pl.when(pl.col('target_name') == col).then(pl.col(col))

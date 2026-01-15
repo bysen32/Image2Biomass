@@ -15,51 +15,28 @@ import torchvision.transforms as T
 import pandas as pd
 from sklearn.model_selection import KFold
 from transformers import AutoModel, AutoProcessor
-from peft import LoraConfig, get_peft_model
 
 warnings.filterwarnings('ignore')
 
 
 class CFG:
-    IS_KAGGLE = 'KAGGLE_KERNEL_RUN_TYPE' in os.environ
-    
     SEED = 42
 
     # 图像尺寸：DINOv2 支持任意尺寸，但Giant建议先用224跑通，显存够再上518
     IMAGE_SIZE = 224
     BATCH_SIZE = 8
-    ACCUMULATE_GRAD = 4
     LR = 2e-4
     EPOCHS = 10
     NUM_WORKERS = 4
-    # LoRA 参数
-    LORA_R = 16
-    LORA_ALPHA = 32
-    LORA_DROPOUT = 0.05
+    NUM_DEVICES = 2
 
-    if IS_KAGGLE:
-        DATA_ROOT = "/kaggle/input/csiro-biomass"
+    DATA_ROOT = "./datasets/csiro-biomass"
 
-        # Kaggle 离线模式下，模型通常存放在 input 目录下
-        MODEL_WEIGHTS_PATH = "/kaggle/input/dinov2/pytorch/giant/1"
-        NUM_DEVICES = 2
 
-        OUTPUT_DIR = "/kaggle/working"
-
-    else:
-        DATA_ROOT = "./datasets/csiro-biomass"
-
-        MODEL_WEIGHTS_PATH = "facebook/dinov2-giant"
-        NUM_DEVICES = 1
-
-        OUTPUT_DIR = "./outputs"
-
-        # if not os.path.exists(MODEL_WEIGHTS_PATH):
-        #     os.makedirs(MODEL_WEIGHTS_PATH, exist_ok=True)
-        if not os.path.exists(OUTPUT_DIR):
-            os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    OUTPUT_DIR = "./outputs/convnext_tiny"
+    # 创建输出目录，如果目录不存在则创建
+    if not os.path.exists(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
 def seed_everything(seed: int=42):
@@ -94,22 +71,23 @@ def weighted_r2_score(y_true: np.ndarray, y_pred: np.ndarray) -> tuple[float, np
 
 
 
-# ========== Dataset ===========
+# ========== Dataset数据集 ===========
 class BiomassDataset(Dataset):
-    def __init__(self, df, transforms=None, mode='train'):
+    def __init__(self, df:pd.DataFrame, transforms:T.Compose=None, mode:str='train'):
         self.df = df
         self.transforms = transforms
         self.mode = mode
-
-    def __len__(self):
+    
+    def __len__(self) -> int:
         return len(self.df)
     
-    def __getitem__(self, idx):
+    def __getitem__(self, idx:int) -> tuple[torch.Tensor, torch.Tensor]:
         row = self.df.iloc[idx]
-        img_path = row['image_path']
-        image = Image.open(f'{CFG.DATA_ROOT}/{row["image_path"]}').convert('RGB')
+        img_path = row['image_path'].strip()
+        image = Image.open(f'{CFG.DATA_ROOT}/{img_path}').convert('RGB')
         if self.transforms:
             image = self.transforms(image)
+
         targets = torch.tensor([
             row["Dry_Green_g"],
             row["Dry_Dead_g"],
@@ -119,91 +97,6 @@ class BiomassDataset(Dataset):
         ], dtype=torch.float32)
         return image, targets
 
-
-class MultiRegressionModel(pl.LightningModule):
-    def __init__(self, lr=1e-4):
-        super().__init__()
-        self.save_hyperparameters()
-        self.backbone = AutoModel.from_pretrained(CFG.MODEL_WEIGHTS_PATH)
-
-        # 开启 gradient checkpointing
-        self.backbone.gradient_checkpointing_enable()
-
-        # 集成LoRA（只训练0.1%的参数）
-        peft_config = LoraConfig(
-            r=CFG.LORA_R,
-            lora_alpha=CFG.LORA_ALPHA,
-            lora_dropout=CFG.LORA_DROPOUT,
-            target_modules=["query", "value", "key", "dense"],
-            lora_dropout=CFG.LORA_DROPOUT,
-            bias="none",
-            modules_to_save=[], # 如果有特定层想全量训练放在这里
-        )
-        self.backbone = get_peft_model(self.backbone, peft_config)
-        self.backbone.print_trainable_parameters() # 打印可训练参数量
-        
-        # 回归头 (Regression Head)
-        self.hidden_size = self.backbone.config.hidden_size
-        self.head = nn.Sequential(
-            nn.Linear(self.hidden_size, self.hidden_size // 2),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(self.hidden_size // 2, 5),
-        )
-        self.criterion = nn.SmoothL1Loss()
-        self.val_outputs = []
-
-    def forward(self, x):
-        outputs = self.backbone(x) # shape: (N, hidden_size)
-
-        # 获取 CLS token （DINOv2 的特征表达）
-        # last_hidden_state shape: [N, Seq_Len, Hidden_Size]
-        cls_token = outputs.last_hidden_state[:, 0, :] # shape: [N, Hidden_Size]
-        logits = self.head(cls_token) # shape: (N, 5)
-        return logits
-    
-    def training_step(self, batch, batch_idx):
-        x, y = batch
-        y_pred = self(x)
-        loss = self.criterion(y_pred, y)
-        self.log('train_loss', loss, on_step=False, on_epoch=True)
-        return loss
-    
-    def validation_step(self, batch, batch_idx):
-        x, y = batch
-        y_pred = self(x)
-        loss = self.criterion(y_pred, y)
-        self.val_outputs.append((y_pred.detach().cpu(), y.detach().cpu()))
-        self.log("val_loss", loss, on_step=False, on_epoch=True)
-        return loss
-    
-    def on_validation_epoch_end(self):
-        if len(self.val_outputs) == 0:
-            self.log("val_weighted_r2", 0.0, prog_bar=True, on_epoch=True)
-            for name in ["Dry_Green_g", "Dry_Dead_g", "Dry_Clover_g", "GDM_g", "Dry_Total_g"]:
-                self.log(f"val_r2_{name}", 0.0, on_epoch=True)
-            self.val_outputs.clear()
-            return
-        
-        y_pred, y_true = zip(*self.val_outputs)
-        y_pred = torch.cat(y_pred).numpy()
-        y_true = torch.cat(y_true).numpy()
-        weighted_r2, r2_scores = weighted_r2_score(y_true, y_pred)
-        self.log("val_weighted_r2", weighted_r2, prog_bar=True, on_epoch=True)
-        for i, name in enumerate(["Dry_Green_g", "Dry_Dead_g", "Dry_Clover_g", "GDM_g", "Dry_Total_g"]):
-            self.log(f"val_r2_{name}", r2_scores[i], on_epoch=True)
-        self.val_outputs.clear()
-        return
-    
-    def configure_optimizers(self):
-        # 只需要优化 LoRA 参数 和 Head 参数
-        optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, self.parameters()), lr=self.hparams.lr)
-
-        # 学习率调度器
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=CFG.EPOCHS, eta_min=1e-6)
-        
-        return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
 
 # =========== DataModule ===========
@@ -242,6 +135,72 @@ class ImageRegressionDataModule(pl.LightningDataModule):
         return DataLoader(self.val_dataset, batch_size=self.batch_size,
                           num_workers=self.num_workers, shuffle=False)
 
+
+# 多目标回归模型
+class MultiRegressionModel(pl.LightningModule):
+    def __init__(self, lr=1e-4):
+        super().__init__()
+        self.save_hyperparameters()
+        self.backbone = timm.create_model('convnext_tiny', pretrained=False, 
+                                          checkpoint_path = 'pretrained_models/convnext_tiny.in12k_ft_in1k/model.safetensors')
+        self.backbone.reset_classifier(0)
+
+        self.hidden_size = self.backbone.num_features
+        self.head = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(self.hidden_size // 2, 5),
+        )
+        self.criterion = nn.SmoothL1Loss()
+        self.val_outputs = []
+
+    def forward(self, x):
+        features = self.backbone(x) # shape: (N, hidden_size)
+        logits = self.head(features) # shape: (N, 5)
+        return logits
+    
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        y_pred = self(x)
+        loss = self.criterion(y_pred, y)
+        self.log('train_loss', loss, on_step=False, on_epoch=True)
+        return loss
+    
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+        y_pred = self(x)
+        loss = self.criterion(y_pred, y)
+        self.val_outputs.append((y_pred.detach().cpu(), y.detach().cpu()))
+        self.log("val_loss", loss, on_step=False, on_epoch=True)
+        return loss
+    
+    def on_validation_epoch_end(self):
+        if len(self.val_outputs) == 0:
+            self.log("val_weighted_r2", 0.0, prog_bar=True, on_epoch=True)
+            for name in ["Dry_Green_g", "Dry_Dead_g", "Dry_Clover_g", "GDM_g", "Dry_Total_g"]:
+                self.log(f"val_r2_{name}", 0.0, on_epoch=True)
+            self.val_outputs.clear()
+            return
+        
+        y_pred, y_true = zip(*self.val_outputs)
+        y_pred = torch.cat(y_pred).numpy()
+        y_true = torch.cat(y_true).numpy()
+        weighted_r2, r2_scores = weighted_r2_score(y_true, y_pred)
+        self.log("val_weighted_r2", weighted_r2, prog_bar=True, on_epoch=True)
+        for i, name in enumerate(["Dry_Green_g", "Dry_Dead_g", "Dry_Clover_g", "GDM_g", "Dry_Total_g"]):
+            self.log(f"val_r2_{name}", r2_scores[i], on_epoch=True)
+        self.val_outputs.clear()
+        return
+    
+    def configure_optimizers(self):
+        # 只需要优化 Backbone 和 Head 参数
+        optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, self.parameters()), lr=self.hparams.lr)
+        # 学习率调度器
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=CFG.EPOCHS, eta_min=1e-6)
+        
+        return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
 
 train_df = pd.read_csv(f'{CFG.DATA_ROOT}/train.csv')

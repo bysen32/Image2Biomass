@@ -210,3 +210,4 @@ __marimo__/
 lightning_logs/
 datasets/
 *.pth
+pretrained_models/

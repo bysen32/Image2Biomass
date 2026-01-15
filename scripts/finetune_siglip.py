@@ -1,4 +1,5 @@
 import os
+# os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 import glob
 from pathlib import Path
 import sys
@@ -166,8 +167,8 @@ def get_model(model_path: str, device: str = 'cpu'):
     processor = AutoImageProcessor.from_pretrained(model_path)
     return model.eval().to(device), processor
 
-dino_path = "/kaggle/input/dinov2/pytorch/giant/1" if IS_KAGGLE else "facebook/dinov2-giant"
-siglip_path = "/kaggle/input/google-siglip-so400m-patch14-384/transformers/default/1" if IS_KAGGLE else "google/siglip-so400m-patch14-384"
+dino_path = "/kaggle/input/dinov2/pytorch/giant/1" if IS_KAGGLE else "pretrained_models/dinov2-giant"
+siglip_path = "/kaggle/input/google-siglip-so400m-patch14-384/transformers/default/1" if IS_KAGGLE else "pretrained_models/google-siglip-so400m-patch14-384"
 
 # dino_model, dino_processor = get_model(
 #     model_path=dino_path, device=device

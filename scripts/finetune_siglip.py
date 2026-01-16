@@ -104,14 +104,6 @@ def pivot_table(df: pd.DataFrame) -> pd.DataFrame:
     return df_pt
 
 
-train_df = pd.read_csv(cfg.DATA_PATH/'train.csv')
-test_df = pd.read_csv(cfg.DATA_PATH/'test.csv')
-train_df = pivot_table(df=train_df)
-test_df = pivot_table(df=test_df)
-
-train_df['image_path'] = train_df['image_path'].apply(lambda p: str(cfg.DATA_PATH / p))
-test_df['image_path'] = test_df['image_path'].apply(lambda p: str(cfg.DATA_PATH / p))
-# train_df = pd.read_csv("/kaggle/input/csiro-datasplit/csiro_data_split.csv")
 
 
 def melt_table(df: pd.DataFrame) -> pd.DataFrame:
@@ -173,8 +165,8 @@ def compute_embeddings(model_path, df, patch_size=520):
 
     model, processor = get_model(model_path=model_path, device=device)
 
-    IMAGE_PATHS = []
-    EMBEDDINGS = []
+    image_paths = []
+    embeddings = []
 
     for i, row in tqdm(df.iterrows(), total=len(df)):
         img_path = row['image_path']
@@ -193,17 +185,32 @@ def compute_embeddings(model_path, df, patch_size=520):
             else:
                 raise Exception("Model should be dino or siglip")
         embeds = features.mean(dim=0).detach().cpu().numpy()
-        EMBEDDINGS.append(embeds)
-        IMAGE_PATHS.append(img_path)
+        embeddings.append(embeds)
+        image_paths.append(img_path)
 
-    embeddings = np.stack(EMBEDDINGS, axis=0)
+    embeddings = np.stack(embeddings, axis=0)
     n_features = embeddings.shape[1]
     emb_columns = [f"emb{i+1}" for i in range(n_features)]
+
     emb_df = pd.DataFrame(embeddings, columns=emb_columns)
-    emb_df['image_path'] = IMAGE_PATHS
+    emb_df['image_path'] = image_paths
+
     df_final = df.merge(emb_df, on='image_path', how='left')
+    # 分组依据
     flush()
-    return df_final 
+    return df_final
+
+def df_group_fold(df: pd.DataFrame) -> pd.DataFrame:
+    if 'Sampling_Date' in df.columns and 'State' in df.columns:
+        df['Sampling_Date&State'] = df['Sampling_Date'] + '_' + df['State']
+        df['groupid'] = df.groupby('Sampling_Date&State').ngroup()
+
+        # GroupKFold 进行划分
+        gfk = GroupKFold(n_splits=5)
+        for i, (train_index, valid_index) in enumerate(gfk.split(df, groups=df['groupid'])):
+            df.loc[valid_index, 'fold'] = i
+        df['fold'] = df['fold'].astype(int)
+    return df
 
 if IS_KAGGLE:   
     dino_path = "/kaggle/input/dinov2/pytorch/giant/1"
@@ -212,20 +219,27 @@ else:
     dino_path = "pretrained_models/dinov2-giant"
     siglip_path = "pretrained_models/google-siglip-so400m-patch14-384"
 
-if not os.path.exists(cfg.SAVE_DATA_PATH):
-    os.makedirs(cfg.SAVE_DATA_PATH)
+
+train_df = pd.read_csv(cfg.DATA_PATH/'train.csv')
+train_df = pivot_table(df=train_df)
+train_df = df_group_fold(df=train_df)
+train_df['image_path'] = train_df['image_path'].apply(lambda p: str(cfg.DATA_PATH / p))
 
 if os.path.exists(cfg.SAVE_DATA_PATH/'train_siglip_df.csv'):
     train_siglip_df = pd.read_csv(cfg.SAVE_DATA_PATH/'train_siglip_df.csv')
 else:
+    if not os.path.exists(cfg.SAVE_DATA_PATH):
+        os.makedirs(cfg.SAVE_DATA_PATH)
     train_siglip_df = compute_embeddings(model_path=siglip_path, df=train_df, patch_size=520)
     train_siglip_df.to_csv(cfg.SAVE_DATA_PATH/'train_siglip_df.csv', index=False)
 
-if os.path.exists(cfg.SAVE_DATA_PATH/'test_siglip_df.csv'):
-    test_siglip_df = pd.read_csv(cfg.SAVE_DATA_PATH/'test_siglip_df.csv')
-else:
-    test_siglip_df = compute_embeddings(model_path=siglip_path, df=test_df, patch_size=520)
-    test_siglip_df.to_csv(cfg.SAVE_DATA_PATH/'test_siglip_df.csv', index=False)
+test_df = pd.read_csv(cfg.DATA_PATH/'test.csv')
+test_df = pivot_table(df=test_df)
+test_df['image_path'] = test_df['image_path'].apply(lambda p: str(cfg.DATA_PATH / p))
+test_siglip_df = compute_embeddings(model_path=siglip_path, df=test_df, patch_size=520)
+
+train_df = train_siglip_df
+test_df = test_siglip_df
 
 flush()
 
@@ -978,6 +992,7 @@ def cross_validate(model, train_data, test_data, feature_engine,
                    target_transform='max', seed=42):
 
     n_splits = train_data['fold'].nunique()
+
     # Setup Targets
     target_max_arr = np.array([TARGET_MAX[t] for t in TARGET_NAMES], dtype=float)
     y_true = train_data[TARGET_NAMES]
@@ -993,7 +1008,7 @@ def cross_validate(model, train_data, test_data, feature_engine,
         valid_mask = train_data['fold'] == fold
         val_idx = train_data[valid_mask].index
 
-        # Raw Inputs (Embeddings)
+        # Raw Inputs (Embeddings) 原始数据
         X_train_raw = train_data[train_mask][COLUMNS].values
         X_valid_raw = train_data[valid_mask][COLUMNS].values
         X_test_raw = test_data[COLUMNS].values
@@ -1884,84 +1899,82 @@ sub_df[['sample_id', 'target']].to_csv("submission_siglip.csv", index=False)
 ############################################################
 # 6️⃣Ensemble submission
 ############################################################
+# 
+# def ensemble_submission(files=None, weights=None, postprocess=True, output_name="submission.csv"):
+#     """
+#     Create ensemble submission from submission_siglip.csv and submission_dinoV3.csv.
+#     Uses weights (sum normalized) and writes output to CFG.SUBMISSION_DIR/output_name.
+#     """
+#     import os
+#     import numpy as np
+#     import pandas as pd
 
-pd.read_csv("submission_siglip.csv")
+#     # Defaults
+#     if files is None:
+#         files = ["submission_siglip.csv", "submission_dinoV3.csv"]
+#     if weights is None:
+#         # Use the Weight variable defined earlier in the notebook if present
+#         try:
+#             w = Weight
+#         except NameError:
+#             w = [0.55, 0.45]
+#     else:
+#         w = weights
 
-def ensemble_submission(files=None, weights=None, postprocess=True, output_name="submission.csv"):
-    """
-    Create ensemble submission from submission_siglip.csv and submission_dinoV3.csv.
-    Uses weights (sum normalized) and writes output to CFG.SUBMISSION_DIR/output_name.
-    """
-    import os
-    import numpy as np
-    import pandas as pd
+#     # Validate
+#     if len(w) != len(files):
+#         raise ValueError("Number of weights must match number of files")
+#     w = np.array(w, dtype=float)
+#     w = w / w.sum()
 
-    # Defaults
-    if files is None:
-        files = ["submission_siglip.csv", "submission_dinoV3.csv"]
-    if weights is None:
-        # Use the Weight variable defined earlier in the notebook if present
-        try:
-            w = Weight
-        except NameError:
-            w = [0.55, 0.45]
-    else:
-        w = weights
+#     # Read submissions
+#     series_list = []
+#     for f in files:
+#         if not os.path.exists(f):
+#             raise FileNotFoundError(f"File not found: {f}")
+#         s = pd.read_csv(f).set_index("sample_id")["target"]
+#         series_list.append(s.rename(os.path.splitext(os.path.basename(f))[0]))
 
-    # Validate
-    if len(w) != len(files):
-        raise ValueError("Number of weights must match number of files")
-    w = np.array(w, dtype=float)
-    w = w / w.sum()
+#     df = pd.concat(series_list, axis=1)  # align by sample_id
 
-    # Read submissions
-    series_list = []
-    for f in files:
-        if not os.path.exists(f):
-            raise FileNotFoundError(f"File not found: {f}")
-        s = pd.read_csv(f).set_index("sample_id")["target"]
-        series_list.append(s.rename(os.path.splitext(os.path.basename(f))[0]))
+#     vals = df.values.astype(float)  # (n_samples, n_models)
+#     mask = ~np.isnan(vals)
 
-    df = pd.concat(series_list, axis=1)  # align by sample_id
+#     numer = np.nansum(vals * w.reshape(1, -1), axis=1)
+#     denom = np.nansum(mask * w.reshape(1, -1), axis=1)
+#     avg = numer / np.where(denom == 0, 1.0, denom)
 
-    vals = df.values.astype(float)  # (n_samples, n_models)
-    mask = ~np.isnan(vals)
+#     out = pd.DataFrame({"sample_id": df.index, "target": avg})
 
-    numer = np.nansum(vals * w.reshape(1, -1), axis=1)
-    denom = np.nansum(mask * w.reshape(1, -1), axis=1)
-    avg = numer / np.where(denom == 0, 1.0, denom)
+#     if postprocess:
+#         # convert to wide per image, apply post_process_biomass (must exist in notebook)
+#         tmp = out.copy()
+#         tmp[["image_id", "target_name"]] = tmp["sample_id"].str.rsplit("__", n=1, expand=True)
+#         wide = tmp.pivot(index="image_id", columns="target_name", values="target").reset_index()
+#         # ensure all cols present
+#         for c in CFG.ALL_TARGET_COLS:
+#             if c not in wide.columns:
+#                 wide[c] = 0.0
+#         # use post_process_biomass defined earlier in the notebook
+#         wide_proc = post_process_biomass(wide)
+#         long = wide_proc.melt(id_vars="image_id", value_vars=CFG.ALL_TARGET_COLS, var_name="target_name", value_name="target")
+#         long["sample_id"] = long["image_id"] + "__" + long["target_name"]
+#         out = long[["sample_id", "target"]].set_index("sample_id").loc[df.index].reset_index()
 
-    out = pd.DataFrame({"sample_id": df.index, "target": avg})
+#     # Align to test.csv ordering if available
+#     try:
+#         test_df = pd.read_csv(CFG.TEST_CSV)
+#         if "sample_id" in test_df.columns:
+#             out = test_df[["sample_id"]].merge(out, on="sample_id", how="left")
+#     except Exception:
+#         pass
 
-    if postprocess:
-        # convert to wide per image, apply post_process_biomass (must exist in notebook)
-        tmp = out.copy()
-        tmp[["image_id", "target_name"]] = tmp["sample_id"].str.rsplit("__", n=1, expand=True)
-        wide = tmp.pivot(index="image_id", columns="target_name", values="target").reset_index()
-        # ensure all cols present
-        for c in CFG.ALL_TARGET_COLS:
-            if c not in wide.columns:
-                wide[c] = 0.0
-        # use post_process_biomass defined earlier in the notebook
-        wide_proc = post_process_biomass(wide)
-        long = wide_proc.melt(id_vars="image_id", value_vars=CFG.ALL_TARGET_COLS, var_name="target_name", value_name="target")
-        long["sample_id"] = long["image_id"] + "__" + long["target_name"]
-        out = long[["sample_id", "target"]].set_index("sample_id").loc[df.index].reset_index()
+#     out["target"] = out["target"].fillna(0.0)
+#     save_path = os.path.join(CFG.SUBMISSION_DIR, output_name)
+#     out.to_csv(save_path, index=False)
+#     print(f"Saved ensemble submission: {save_path} (rows={len(out)})")
+#     return out
 
-    # Align to test.csv ordering if available
-    try:
-        test_df = pd.read_csv(CFG.TEST_CSV)
-        if "sample_id" in test_df.columns:
-            out = test_df[["sample_id"]].merge(out, on="sample_id", how="left")
-    except Exception:
-        pass
-
-    out["target"] = out["target"].fillna(0.0)
-    save_path = os.path.join(CFG.SUBMISSION_DIR, output_name)
-    out.to_csv(save_path, index=False)
-    print(f"Saved ensemble submission: {save_path} (rows={len(out)})")
-    return out
-
-# Convenience call using your requested weights
-# Run this cell to produce submission.csv
-ensemble_submission(files=["submission_siglip.csv","submission_dinoV3.csv"], weights=Weight, postprocess=True, output_name="submission.csv")
+# # Convenience call using your requested weights
+# # Run this cell to produce submission.csv
+# ensemble_submission(files=["submission_siglip.csv","submission_dinoV3.csv"], weights=Weight, postprocess=True, output_name="submission.csv")

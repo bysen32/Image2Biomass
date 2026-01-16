@@ -1,4 +1,6 @@
-# 0️⃣DINOv2-Giant + Lasso Regression
+#######################################################
+# DINOv2-Giant + Lasso Regression
+#######################################################
 import os
 import gc
 import numpy as np
@@ -19,7 +21,7 @@ print(f"Inference device: {DEVICE}")
 
 IS_KAGGLE = 'KAGGLE_KERNEL_RUN_TYPE' in os.environ
 
-
+########################################################
 # 1️⃣Load Models
 
 dino_path = "/kaggle/input/dinov2/pytorch/giant/1" if IS_KAGGLE else "facebook/dinov2-giant"
@@ -28,6 +30,7 @@ model = AutoModel.from_pretrained(dino_path)
 model = model.to(DEVICE)
 print("DINOv2 Models loaded.")
 
+########################################################
 # 2️⃣Prepare Training Data
 
 ROOT = "/kaggle/input/csiro-biomass/"
@@ -49,10 +52,9 @@ for _, row in train_df.iterrows():
     targets[target_idx].append(torch.tensor([[row['target']]]))
     
 
-# DINOv2-Giant Extracting Train Features 
-
-desc = "DINOv2-Giant"
-desc = f"  {desc} Extracting train features"
+########################################################
+# 3️⃣DINOv2-Giant Extracting Train Features 
+desc = f"  DINOv2-Giant Extracting train features"
 for i, entry in tqdm(unique_train_images.iterrows(), total=len(unique_train_images), desc=desc):
     file_path = os.path.join(ROOT, entry['image_path'])
     with Image.open(file_path) as img:
@@ -63,6 +65,7 @@ for i, entry in tqdm(unique_train_images.iterrows(), total=len(unique_train_imag
 
 embeds_np = np.array(torch.cat(embeds))
 
+########################################################
 # 3️⃣Train Lasso Model
 
 from sklearn.model_selection import KFold
@@ -96,6 +99,7 @@ oof_df = pd.DataFrame(oof_preds_np, columns=target_columns)
 oof_df['image_path'] = unique_train_images['image_path']
 oof_df.to_csv('oof_model1.csv', index=False)
 
+########################################################
 # 4️⃣Inference on Test Data
 
 print("  Running predictions on test data...")
@@ -112,6 +116,7 @@ for img_path in tqdm(test_df['image_path'].unique(), desc=f"  {desc} Extracting 
         
         
         
+########################################################
 # 5️⃣Save Results
 
 predictions, sample_ids = [], []
@@ -133,7 +138,9 @@ submission.sort_values('sample_id').reset_index(drop=True)
 submission.to_csv(output_path, index=False)
 print(f"--- [Done] Model 1: Predictions saved to {output_path} ---")
 
+########################################################
 # Free up memory
+###################
 del submission
 gc.collect()
 if torch.cuda.is_available():

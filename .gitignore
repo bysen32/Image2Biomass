@@ -211,3 +211,4 @@ lightning_logs/
 datasets/
 *.pth
 pretrained_models/
+save_data/

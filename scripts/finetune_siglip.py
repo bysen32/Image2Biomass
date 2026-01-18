@@ -37,6 +37,9 @@ from sklearn import model_selection
 from sklearn import preprocessing
 
 from dataclasses import dataclass
+from pathlib import Path
+from tqdm import tqdm
+from copy import deepcopy
 # from typing import Optional, Dict
 
 # import matplotlib.pyplot as plt
@@ -73,7 +76,7 @@ class Config:
         "/kaggle/input/csiro-biomass/") if IS_KAGGLE else Path("./datasets/csiro-biomass/")
     TRAIN_DATA_PATH: Path = DATA_PATH/'train'
     TEST_DATA_PATH: Path = DATA_PATH/'test'
-    SAVE_DATA_PATH: Path = Path("/kaggle/outputs/working") if IS_KAGGLE else Path("save_data")
+    SAVE_DATA_PATH: Path = Path("/kaggle/working/") if IS_KAGGLE else Path("./save_data")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     seed = 42
@@ -102,7 +105,6 @@ def pivot_table(df: pd.DataFrame) -> pd.DataFrame:
             aggfunc='mean'
         ).reset_index()
     return df_pt
-
 
 
 
@@ -342,7 +344,7 @@ def generate_semantic_features(image_embeddings, model_path=siglip_path):
     """
     Generates 'Concept Scores' by averaging synonyms and calculating biological ratios.
     """
-    print(f"Loading SigLIP Text Encoder from {model_path}...")
+    print(f"Loading SigLIP Text Encoder from {model_path}")
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     try:
@@ -370,6 +372,7 @@ def generate_semantic_features(image_embeddings, model_path=siglip_path):
         "weeds": ["broadleaf weeds", "thistles", "non-pasture vegetation"]
     }
     
+    breakpoint()
     # 2. Encode and Average Prompts for each Concept
     concept_vectors = {}
     with torch.no_grad():
@@ -611,15 +614,22 @@ def competition_metric(y_true, y_pred) -> float:
 def post_process_biomass(df_preds):
     """
     Enforces physical mass balance constraints on biomass predictions.
+    对生物量预测施加物理质量平衡约束。
     
     Constraints enforced:
     1. Dry_Green_g + Dry_Clover_g = GDM_g
     2. GDM_g + Dry_Dead_g = Dry_Total_g
-    
+    所施加的约束：
+    1. 绿色干重（克）+ 三叶草干重（克）= 总绿色干物质（克）
+    2. 总绿色干物质（克）+ 枯死干重（克）= 总干重（克）
+
     Method:
     Uses Orthogonal Projection. It finds the set of values that satisfy
     the constraints while minimizing the Euclidean distance to the 
     original model predictions.
+    方法：
+    采用正交投影法。该方法会找到一组满足约束条件的值，
+    同时使这些值与原始模型预测值之间的欧氏距离最小。
     
     Args:
         df_preds (pd.DataFrame): DataFrame containing the 5 prediction columns.
@@ -1894,7 +1904,9 @@ test_df = post_process_biomass(test_df)
 # test_df['GDM_g'] = test_df['Dry_Green_g'] + test_df['Dry_Clover_g']
 # test_df['Dry_Total_g'] = test_df['GDM_g'] + test_df['Dry_Dead_g']
 sub_df = melt_table(test_df)
-sub_df[['sample_id', 'target']].to_csv("submission_siglip.csv", index=False)
+save_path = os.path.join(cfg.SAVE_DATA_PATH, "submission.csv")
+sub_df[['sample_id', 'target']].to_csv(save_path, index=False)
+print(f"Saved submission to {save_path}")
 
 ############################################################
 # 6️⃣Ensemble submission

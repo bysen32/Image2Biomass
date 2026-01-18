@@ -1,6 +1,6 @@
-# show timm version
+# Main pipeline tuning dinoV3_840m
 ############################################################
-# 0.Import
+# 0️⃣.Init Environment
 ############################################################
 from contextlib import nullcontext
 import pandas as pd
@@ -14,6 +14,7 @@ import os
 import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
+from safetensors.torch import load_file
 from sklearn.model_selection import KFold, StratifiedGroupKFold
 from timm.utils import ModelEmaV2
 from albumentations.pytorch import ToTensorV2
@@ -24,35 +25,38 @@ from tqdm import tqdm
 import timm
 print(timm.__version__)
 
-is_kaggle = 'KAGGLE_KERNEL_RUN_TYPE' in os.environ
+IS_KAGGLE = 'KAGGLE_KERNEL_RUN_TYPE' in os.environ
 
 ############################################################
-# 1.Config
+# 1️⃣.Config
 ############################################################
 
 
 class CFG:
-    CREATE_SUBMISSION = False
-    USE_TQDM = False
+    CREATE_SUBMISSION = True
+    USE_TQDM = True
     PRETRAINED_DIR = None
     PRETRAINED = True
     BASE_PATH = '/kaggle/input/csiro-biomass'
     SEED = 82947501
     FOLDS_TO_TRAIN = [0, 1, 2, 3, 4]
-    TRAIN_CSV = os.path.join(BASE_PATH, 'train.csv')
-    TRAIN_IMAGE_DIR = os.path.join(BASE_PATH, 'train')
-    TEST_IMAGE_DIR = '/kaggle/input/csiro-biomass/test' if is_kaggle else './datasets/csiro-biomass/test'
-    TEST_CSV = '/kaggle/input/csiro-biomass/test.csv'
-    SUBMISSION_DIR = '/kaggle/working/'
-    MODEL_DIR = '/kaggle/working/5-folds-dinov3-840m'
-    MODEL_DIR_012 = '/kaggle/input/5-folds-dinov3-840m/other/fold-0-1-2/1'
-    MODEL_DIR_34 = '/kaggle/input/5-folds-dinov3-840m/other/fold-0-1-2/2'
+    TRAIN_IMAGE_DIR = os.path.join(BASE_PATH, 'train') if IS_KAGGLE else './datasets/csiro-biomass/train'
+    TRAIN_CSV = os.path.join(BASE_PATH, 'train.csv') if IS_KAGGLE else './datasets/csiro-biomass/train.csv'
+    TEST_IMAGE_DIR = '/kaggle/input/csiro-biomass/test' if IS_KAGGLE else './datasets/csiro-biomass/test'
+    TEST_CSV = '/kaggle/input/csiro-biomass/test.csv' if IS_KAGGLE else './datasets/csiro-biomass/test.csv'
+    SUBMISSION_DIR = '/kaggle/working/' if IS_KAGGLE else './save_data'
+    MODEL_DIR = '/kaggle/working/5-folds-dinov3-840m' if IS_KAGGLE else './save_data/5-folds-dinov3-840m'
+    MODEL_DIR_012 = '/kaggle/input/5-folds-dinov3-840m' if IS_KAGGLE else './save_data/5-folds-dinov3-840m'
+    MODEL_DIR_34 = '/kaggle/input/5-folds-dinov3-840m' if IS_KAGGLE else './save_data/5-folds-dinov3-840m'
     N_FOLDS = 5
 
     # MODEL_NAME      = 'vit_large_patch16_dinov3.lvd1689m'
     # BACKBONE_PATH   = '/kaggle/input/vit-large-patch16-dinov3-lvd1689m-backbone-pth/vit_large_patch16_dinov3.lvd1689m_backbone.pth'
     MODEL_NAME = 'vit_huge_plus_patch16_dinov3.lvd1689m'
-    BACKBONE_PATH = '/kaggle/input/vit-huge-plus-patch16-dinov3-lvd1689m/vit_huge_plus_patch16_dinov3.lvd1689m_backbone.pth'
+    if IS_KAGGLE:
+        BACKBONE_PATH = '/kaggle/input/vit-huge-plus-patch16-dinov3/vit_huge_plus_patch16_dinov3.lvd1689m_backbone.safetensors'
+    else:
+        BACKBONE_PATH = './pretrained_models/vit-huge-plus-patch16-dinov3/vit_huge_plus_patch16_dinov3.lvd1689m_backbone.safetensors'
 
     IMG_SIZE = 512
 
@@ -84,8 +88,9 @@ print(f'Backbone: {CFG.MODEL_NAME} | Input: {CFG.IMG_SIZE}')
 print(f'Freeze Epochs: {CFG.FREEZE_EPOCHS} | Warmup: {CFG.WARMUP_EPOCHS}')
 print(f'EMA Decay: {CFG.EMA_DECAY} | Grad Acc: {CFG.GRAD_ACC}')
 
+
 ##################################
-# 2.Metrics
+# 2️⃣.Metrics
 ############################################################
 
 def weighted_r2_score(y_true: np.ndarray, y_pred: np.ndarray):
@@ -187,7 +192,9 @@ def compare_train_val(tr_df, val_df, targets, show_plots=True):
 
 
 
-# Dataset & Augmentation
+############################################################
+# 3️⃣.Dataset & Augmentation
+############################################################
 
 def get_train_transforms():
     return A.Compose([
@@ -296,7 +303,7 @@ class BiomassDataset(Dataset):
 
 
 ############################################################
-# 3.Model
+# 4️⃣.Model
 ############################################################
 
 # class BiomassModel(nn.Module):
@@ -417,17 +424,19 @@ class BiomassModel(nn.Module):
             if self.backbone_path and os.path.exists(self.backbone_path):
                 print(
                     f"Loading backbone weights from local file: {self.backbone_path}")
-                sd = torch.load(self.backbone_path, map_location='cpu')
+                sd = load_file(self.backbone_path)
+                # sd = torch.load(self.backbone_path, map_location='cpu')
                 # Handle common checkpoint wrappers (e.g. if saved with 'model' key)
-                if 'model' in sd:
-                    sd = sd['model']
-                elif 'state_dict' in sd:
-                    sd = sd['state_dict']
+                # if 'model' in sd:
+                #     sd = sd['model']
+                # elif 'state_dict' in sd:
+                #     sd = sd['state_dict']
             else:
                 # Original behavior: Download from internet
-                print("Downloading backbone weights...")
-                sd = timm.create_model(
-                    self.model_name, pretrained=True, num_classes=0, global_pool='').state_dict()
+                raise ValueError("Backbone path not found")
+                # print("Downloading backbone weights...")
+                # sd = timm.create_model(
+                #     self.model_name, pretrained=True, num_classes=0, global_pool='').state_dict()
 
             # Interpolate pos_embed if needed (for 256x256 vs 224x224)
             if 'pos_embed' in sd and hasattr(self.backbone, 'pos_embed'):
@@ -502,8 +511,9 @@ def biomass_loss(outputs, labels, w=None):
     w = w / w.sum()
     return (losses * w).sum()
 
-
-# Train Functions with EMA & Gradient Accumulation
+############################################################
+# 5️⃣.Train Functions with EMA & Gradient Accumulation
+############################################################
 
 scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
 
@@ -691,8 +701,9 @@ def train_epoch(model, loader, opt, scheduler, device, ema: ModelEmaV2 | None = 
     scheduler.step()
     return running / len(loader.dataset)
 
-
-# 5-Fold Training Loop with EMA
+############################################################
+# 6️⃣.5-Fold Training Loop with EMA
+############################################################
 
 print('Loading data...')
 df_long = pd.read_csv(CFG.TRAIN_CSV)
@@ -853,8 +864,9 @@ if oof_true:
 else:
     print('No OOF predictions collected.')
 
-
-# Submit
+############################################################
+# 7️⃣.Submit
+############################################################
 
 # ===============================================================
 # 4. DEFINE TTA TRANSFORMS
@@ -923,6 +935,8 @@ def clean_image(img):
     if np.sum(mask) > 0:
         img = cv2.inpaint(img, mask, 3, cv2.INPAINT_TELEA)
     return img
+
+
 class BiomassTestDataset(Dataset):
     """
     Test dataset for biomass images.
@@ -964,7 +978,6 @@ print("✓ Test dataset class defined")
 # ===============================================================
 # 8. RUN INFERENCE WITH TTA (UPDATED to honor CFG.FOLDS_TO_TRAIN)
 # ===============================================================
-
 @torch.no_grad()
 def predict_with_tta(model, left_np, right_np, tta_transforms):
     """
@@ -1224,7 +1237,7 @@ def create_submission(predictions, filenames):
     submission = submission.sort_values('sample_id').reset_index(drop=True)
     
     # Step 9: Save to CSV
-    output_path = os.path.join(CFG.SUBMISSION_DIR, 'submission_dinoV3.csv')
+    output_path = os.path.join(CFG.SUBMISSION_DIR, 'submission.csv')
     submission.to_csv(output_path, index=False)
     
     print(f"\n✓ Submission file saved: {output_path}")

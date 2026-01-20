@@ -49,9 +49,9 @@ class CFG:
     TEST_IMAGE_DIR = '/kaggle/input/csiro-biomass/test' if IS_KAGGLE else './datasets/csiro-biomass/test'
     TEST_CSV = '/kaggle/input/csiro-biomass/test.csv' if IS_KAGGLE else './datasets/csiro-biomass/test.csv'
     SUBMISSION_DIR = '/kaggle/working/' if IS_KAGGLE else './save_data'
-    MODEL_DIR = '/kaggle/working/5-folds-dinov3-840m' if IS_KAGGLE else './save_data/5-folds-dinov3-840m'
-    MODEL_DIR_012 = '/kaggle/working/5-folds-dinov3-840m' if IS_KAGGLE else './save_data/5-folds-dinov3-840m'
-    MODEL_DIR_34 = '/kaggle/working/5-folds-dinov3-840m' if IS_KAGGLE else './save_data/5-folds-dinov3-840m'
+    MODEL_DIR = '/kaggle/working/5-folds-dinov3-840m' if IS_KAGGLE else './save_data/5-folds-dinov3-840m-epoch100'
+    MODEL_DIR_012 = '/kaggle/working/5-folds-dinov3-840m' if IS_KAGGLE else './save_data/5-folds-dinov3-840m-epoch100'
+    MODEL_DIR_34 = '/kaggle/working/5-folds-dinov3-840m' if IS_KAGGLE else './save_data/5-folds-dinov3-840m-epoch100'
     N_FOLDS = 5
 
     # MODEL_NAME      = 'vit_large_patch16_dinov3.lvd1689m'
@@ -74,9 +74,9 @@ class CFG:
     BATCH_SIZE = 1
     GRAD_ACC = 4
     NUM_WORKERS = 4
-    EPOCHS = 1
+    EPOCHS = 100
     FREEZE_EPOCHS = 0
-    WARMUP_EPOCHS = 3
+    WARMUP_EPOCHS = 5
     LR_REST = 1e-3
     LR_BACKBONE = 5e-4
     WD = 1e-2
@@ -392,6 +392,21 @@ class LocalMambaBlock(nn.Module):
         return shortcut + x
 
 
+class FilmGenerator(nn.Module):
+    def __init__(self, feat_dim):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(feat_dim, feat_dim // 2), 
+            nn.ReLU(inplace=True), 
+            nn.Linear(feat_dim // 2, feat_dim * 2)
+        )
+
+    def forward(self, x):
+        x = self.mlp(x)
+        gamma, beta = torch.chunk(x, 2, dim=1)
+        return gamma, beta
+
+
 class BiomassModel(nn.Module):
     def __init__(self, model_name, pretrained=True, backbone_path=None):
         super().__init__()
@@ -401,6 +416,8 @@ class BiomassModel(nn.Module):
         # 1. Load Backbone with global_pool='' to keep patch tokens
         #    (B, 197, 1024) instead of (B, 1024)
         self.backbone = timm.create_model(self.model_name, pretrained=False, num_classes=0, global_pool='')
+
+        # self.film = FilmGenerator(self.backbone.num_features)
 
         # 2. Enable Gradient Checkpointing (Crucial for ViT-Large memory!)
         if hasattr(self.backbone, 'set_grad_checkpointing'):
@@ -427,19 +444,16 @@ class BiomassModel(nn.Module):
         # 4. Pooling & Heads
         self.pool = nn.AdaptiveAvgPool1d(1)
 
+        def make_head():
+            return nn.Sequential(
+                nn.Linear(nf, nf//2), nn.GELU(), nn.Dropout(0.2),
+                nn.Linear(nf//2, 1), nn.Softplus()
+            )
+
         # Heads (using the same logic as before, but on fused features)
-        self.head_green_raw = nn.Sequential(
-            nn.Linear(nf, nf//2), nn.GELU(), nn.Dropout(0.2),
-            nn.Linear(nf//2, 1), nn.Softplus()
-        )
-        self.head_clover_raw = nn.Sequential(
-            nn.Linear(nf, nf//2), nn.GELU(), nn.Dropout(0.2),
-            nn.Linear(nf//2, 1), nn.Softplus()
-        )
-        self.head_dead_raw = nn.Sequential(
-            nn.Linear(nf, nf//2), nn.GELU(), nn.Dropout(0.2),
-            nn.Linear(nf//2, 1), nn.Softplus()
-        )
+        self.head_green_raw = make_head()
+        self.head_clover_raw = make_head()
+        self.head_dead_raw = make_head()
 
         if pretrained:
             self.load_pretrained()
@@ -486,6 +500,11 @@ class BiomassModel(nn.Module):
 
         # 2. Concatenate Left and Right tokens along sequence dimension
         #    (B, N, D) + (B, N, D) -> (B, 2N, D)
+        # context = (x_l + x_r) / 2
+        # gamma, beta = self.film(context)
+        # x_l_modulated = x_l * (1 + gamma) + beta
+        # x_r_modulated = x_r * (1 + gamma) + beta
+
         x_cat = torch.cat([x_l, x_r], dim=1)
 
         # 3. Apply Mamba Fusion
@@ -768,6 +787,27 @@ def train_epoch(model, loader, opt, scheduler, device, ema: ModelEmaV2 | None = 
 # 6️⃣.5-Fold Training Loop with EMA
 ############################################################
 
+class EarlyStopping:
+    def __init__(self, patience=5, min_delta=1e-4):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_score = None
+
+    def step(self, score):
+        if self.best_score is None or score < self.best_score - self.min_delta:
+            self.best_score = score
+            self.counter = 0
+            return True
+        else:
+            self.counter += 1
+            return False
+
+    def should_stop(self):
+        return self.counter >= self.patience
+    
+    
+    
 # Helper for accurate GPU timings
 def _sync():
     if torch.cuda.is_available():
@@ -837,7 +877,7 @@ for fold, (tr_idx, val_idx) in enumerate(sgkf.split(df_wide, y_stratify, groups=
     print('Building model...')
     backbone_path = getattr(CFG, 'BACKBONE_PATH', None)
     model = BiomassModel(CFG.MODEL_NAME, pretrained=CFG.PRETRAINED, backbone_path=backbone_path).to(CFG.DEVICE)
-    
+
     # Load pretrained fold weights if available (for resuming or fine-tuning)
     # if getattr(CFG, 'PRETRAINED_DIR', None) and os.path.isdir(CFG.PRETRAINED_DIR):
     #     pretrained_path = os.path.join(CFG.PRETRAINED_DIR, f'best_model_fold{fold}.pth')

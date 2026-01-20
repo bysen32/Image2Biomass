@@ -2,6 +2,9 @@
 ############################################################
 # 0️⃣.Init Environment
 ############################################################
+import os
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+
 from contextlib import nullcontext
 import pandas as pd
 import cv2
@@ -10,7 +13,7 @@ import torch.optim as optim
 import torch.nn as nn
 import gc
 import torch
-import os
+import time
 import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -22,6 +25,7 @@ import albumentations as A
 from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
+import random
 import timm
 print(timm.__version__)
 
@@ -36,7 +40,7 @@ class CFG:
     CREATE_SUBMISSION = True
     USE_TQDM = True
     PRETRAINED_DIR = None
-    PRETRAINED = True
+    PRETRAINED = True 
     BASE_PATH = '/kaggle/input/csiro-biomass'
     SEED = 82947501
     FOLDS_TO_TRAIN = [0, 1, 2, 3, 4]
@@ -46,22 +50,26 @@ class CFG:
     TEST_CSV = '/kaggle/input/csiro-biomass/test.csv' if IS_KAGGLE else './datasets/csiro-biomass/test.csv'
     SUBMISSION_DIR = '/kaggle/working/' if IS_KAGGLE else './save_data'
     MODEL_DIR = '/kaggle/working/5-folds-dinov3-840m' if IS_KAGGLE else './save_data/5-folds-dinov3-840m'
-    MODEL_DIR_012 = '/kaggle/input/5-folds-dinov3-840m' if IS_KAGGLE else './save_data/5-folds-dinov3-840m'
-    MODEL_DIR_34 = '/kaggle/input/5-folds-dinov3-840m' if IS_KAGGLE else './save_data/5-folds-dinov3-840m'
+    MODEL_DIR_012 = '/kaggle/working/5-folds-dinov3-840m' if IS_KAGGLE else './save_data/5-folds-dinov3-840m'
+    MODEL_DIR_34 = '/kaggle/working/5-folds-dinov3-840m' if IS_KAGGLE else './save_data/5-folds-dinov3-840m'
     N_FOLDS = 5
 
     # MODEL_NAME      = 'vit_large_patch16_dinov3.lvd1689m'
     # BACKBONE_PATH   = '/kaggle/input/vit-large-patch16-dinov3-lvd1689m-backbone-pth/vit_large_patch16_dinov3.lvd1689m_backbone.pth'
     MODEL_NAME = 'vit_huge_plus_patch16_dinov3.lvd1689m'
     if IS_KAGGLE:
-        BACKBONE_PATH = '/kaggle/input/vit-huge-plus-patch16-dinov3/vit_huge_plus_patch16_dinov3.lvd1689m_backbone.safetensors'
+        BACKBONE_PATH = '/kaggle/input/vit-huge-plus-patch16-dinov3/pytorch/default/1/vit_huge_plus_patch16_dinov3.lvd1689m.safetensors'
+        # BACKBONE_PATH = '/kaggle/input/vit-huge-plus-patch16-dinov3-lvd1689m/vit_huge_plus_patch16_dinov3.lvd1689m_backbone.pth'
     else:
         BACKBONE_PATH = './pretrained_models/vit-huge-plus-patch16-dinov3/vit_huge_plus_patch16_dinov3.lvd1689m_backbone.safetensors'
+        # BACKBONE_PATH = None
+
+    DINO_GRADE_CHECKPOINTING = False
 
     IMG_SIZE = 512
 
     VAL_TTA_TIMES = 1
-    TTA_STEPS = 1
+    TTA_STEPS = 1 # 测试增强
 
     BATCH_SIZE = 1
     GRAD_ACC = 4
@@ -76,17 +84,32 @@ class CFG:
     PATIENCE = 5
     TARGET_COLS = ['Dry_Total_g', 'GDM_g', 'Dry_Green_g']
     DERIVED_COLS = ['Dry_Clover_g', 'Dry_Dead_g']
-    ALL_TARGET_COLS = ['Dry_Green_g', 'Dry_Dead_g',
-                       'Dry_Clover_g', 'GDM_g', 'Dry_Total_g']
+    ALL_TARGET_COLS = ['Dry_Green_g', 'Dry_Dead_g', 'Dry_Clover_g', 'GDM_g', 'Dry_Total_g']
     R2_WEIGHTS = np.array([0.1, 0.1, 0.1, 0.2, 0.5])
     LOSS_WEIGHTS = np.array([0.1, 0.1, 0.1, 0.0, 0.0])
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
+def seeding(SEED):
+    np.random.seed(SEED)
+    random.seed(SEED)
+    os.environ['PYTHONHASHSEED'] = str(SEED)
+    torch.manual_seed(SEED)
+    # pl.seed_everything(SEED)
+    if torch.cuda.is_available(): 
+        torch.cuda.manual_seed(SEED)
+        torch.cuda.manual_seed_all(SEED)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    print('seeding done!!!')
+
+seeding(CFG.SEED)
+
 print(f'Device : {CFG.DEVICE}')
 print(f'Backbone: {CFG.MODEL_NAME} | Input: {CFG.IMG_SIZE}')
 print(f'Freeze Epochs: {CFG.FREEZE_EPOCHS} | Warmup: {CFG.WARMUP_EPOCHS}')
 print(f'EMA Decay: {CFG.EMA_DECAY} | Grad Acc: {CFG.GRAD_ACC}')
+
 
 
 ##################################
@@ -107,7 +130,6 @@ def weighted_r2_score(y_true: np.ndarray, y_pred: np.ndarray):
     weighted = np.sum(r2_scores * weights) / np.sum(weights)
     return weighted, r2_scores
 
-
 def weighted_r2_score_global(y_true: np.ndarray, y_pred: np.ndarray):
     weights = CFG.R2_WEIGHTS
     flat_true = y_true.reshape(-1)
@@ -119,7 +141,6 @@ def weighted_r2_score_global(y_true: np.ndarray, y_pred: np.ndarray):
     global_r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
     avg_r2, per_r2 = weighted_r2_score(y_true, y_pred)
     return global_r2, avg_r2, per_r2
-
 
 def analyze_errors(val_df, y_true, y_pred, targets, top_n=5):
     print(f'\n--- Top {top_n} High Loss Samples per Target ---')
@@ -143,7 +164,6 @@ def analyze_errors(val_df, y_true, y_pred, targets, top_n=5):
             err = errors[idx]
             print(
                 f'{idx:<6} | {path_disp:<40} | {t_val:<10.4f} | {p_val:<10.4f} | {err:<10.4f}')
-
 
 def compare_train_val(tr_df, val_df, targets, show_plots=True):
     """Quick comparison of target distributions and metadata between train and val splits."""
@@ -189,7 +209,6 @@ def compare_train_val(tr_df, val_df, targets, show_plots=True):
                              keys=['train', 'val']).fillna(0)
 
         print(state_df)
-
 
 
 ############################################################
@@ -240,8 +259,7 @@ def get_tta_transforms(mode=0):
         # To match exactly 90 degrees in Albumentations, we might need Rotate(limit=(90,90), p=1.0)
         # But RandomRotate90 is standard TTA. Let's use Rotate(limit=(90,90)) to be precise if that's what reference does.
         # Reference: transforms.RandomRotation([90, 90]) -> rotates by exactly 90 degrees.
-        transforms_list.append(A.Rotate(limit=(
-            90, 90), p=1.0, interpolation=cv2.INTER_LINEAR, border_mode=cv2.BORDER_REFLECT_101))
+        transforms_list.append(A.Rotate(limit=(90, 90), p=1.0, interpolation=cv2.INTER_LINEAR, border_mode=cv2.BORDER_REFLECT_101))
 
     transforms_list.extend([
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
@@ -290,6 +308,7 @@ class BiomassDataset(Dataset):
         img = cv2.imread(path)
         if img is None:
             img = np.zeros((1000, 2000, 3), dtype=np.uint8)
+
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         img = clean_image(img)
         h, w, _ = img.shape
@@ -381,8 +400,7 @@ class BiomassModel(nn.Module):
 
         # 1. Load Backbone with global_pool='' to keep patch tokens
         #    (B, 197, 1024) instead of (B, 1024)
-        self.backbone = timm.create_model(
-            self.model_name, pretrained=False, num_classes=0, global_pool='')
+        self.backbone = timm.create_model(self.model_name, pretrained=False, num_classes=0, global_pool='')
 
         # 2. Enable Gradient Checkpointing (Crucial for ViT-Large memory!)
         if hasattr(self.backbone, 'set_grad_checkpointing'):
@@ -390,6 +408,14 @@ class BiomassModel(nn.Module):
             print("✓ Gradient Checkpointing enabled (saves ~50% VRAM)")
 
         nf = self.backbone.num_features
+
+        
+        # 定义一个简单的 MLP 来生成 FiLM 参数 gamma 和 beta
+        # self.film_generator = nn.Sequential(
+        #     nn.Linear(2, 32),
+        #     nn.ReLU(),
+        #     nn.Linear(32, 2 * 8)
+        # )
 
         # 3. Mamba Fusion Neck
         #    Mixes the concatenated tokens [Left, Right]
@@ -424,19 +450,17 @@ class BiomassModel(nn.Module):
             if self.backbone_path and os.path.exists(self.backbone_path):
                 print(
                     f"Loading backbone weights from local file: {self.backbone_path}")
-                sd = load_file(self.backbone_path)
-                # sd = torch.load(self.backbone_path, map_location='cpu')
-                # Handle common checkpoint wrappers (e.g. if saved with 'model' key)
-                # if 'model' in sd:
-                #     sd = sd['model']
-                # elif 'state_dict' in sd:
-                #     sd = sd['state_dict']
+                if self.backbone_path.endswith('.pth'):
+                    sd = torch.load(self.backbone_path, map_location='cpu')
+                    # Handle common checkpoint wrappers (e.g. if saved with 'model' key)
+                    if 'model' in sd: sd = sd['model']
+                    elif 'state_dict' in sd: sd = sd['state_dict']
+                elif self.backbone_path.endswith('.safetensors'):
+                    sd = load_file(self.backbone_path)
             else:
                 # Original behavior: Download from internet
-                raise ValueError("Backbone path not found")
-                # print("Downloading backbone weights...")
-                # sd = timm.create_model(
-                #     self.model_name, pretrained=True, num_classes=0, global_pool='').state_dict()
+                print("Downloading backbone weights...")
+                sd = timm.create_model(self.model_name, pretrained=True, num_classes=0, global_pool='').state_dict()
 
             # Interpolate pos_embed if needed (for 256x256 vs 224x224)
             if 'pos_embed' in sd and hasattr(self.backbone, 'pos_embed'):
@@ -494,11 +518,11 @@ def biomass_loss(outputs, labels, w=None):
     # Huber loss for robust regression (beta=5.0 as recommended)
     huber = nn.SmoothL1Loss(beta=5.0)
 
-    l_green = huber(green.squeeze(),  labels[:, 0])
-    l_dead = huber(dead.squeeze(), labels[:, 1])  # Use Huber loss for Dead
-    l_clover = huber(clover.squeeze(), labels[:, 2])
-    l_gdm = huber(gdm.squeeze(),    labels[:, 3])
-    l_total = huber(total.squeeze(),  labels[:, 4])
+    l_green = huber(green.squeeze(dim=0),  labels[:, 0])
+    l_dead = huber(dead.squeeze(dim=0), labels[:, 1])  # Use Huber loss for Dead
+    l_clover = huber(clover.squeeze(dim=0), labels[:, 2])
+    l_gdm = huber(gdm.squeeze(dim=0),    labels[:, 3])
+    l_total = huber(total.squeeze(dim=0),  labels[:, 4])
 
     # Stack per-target losses in the SAME order as CFG.ALL_TARGET_COLS
     losses = torch.stack([l_green, l_dead, l_clover, l_gdm, l_total])
@@ -514,117 +538,142 @@ def biomass_loss(outputs, labels, w=None):
 ############################################################
 # 5️⃣.Train Functions with EMA & Gradient Accumulation
 ############################################################
+USE_BF16 = True
+AMP_DTYPE = torch.bfloat16 if USE_BF16 else torch.float16
+
 
 scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
 
+def autocast_ctx():
+    if not torch.cuda.is_available():
+        return nullcontext()
+    return torch.amp.autocast(device_type='cuda', dtype=AMP_DTYPE)
+
+def _as_col(x: torch.Tensor, bs: int) -> torch.Tensor:
+    """Force predictions to (B,1) regardless of model head returning (B,) or (B,1)."""
+    if x.ndim == 1:
+        return x.view(bs, 1)
+    if x.ndim == 2:
+        return x
+    return x.view(bs, 1)
+
+def _ensure_2d_lab(lab: torch.Tensor, bs: int) -> torch.Tensor:
+    """Force labels to (B,T)."""
+    if lab.ndim == 1:
+        return lab.view(bs, -1)
+    return lab
+
+def _pred_pack(p_total, p_gdm, p_green, p_clover, p_dead, bs: int) -> torch.Tensor:
+    """
+    Pack predictions in the exact order expected by your metric:
+    CFG.ALL_TARGET_COLS = ['Dry_Green_g','Dry_Dead_g','Dry_Clover_g','GDM_g','Dry_Total_g']
+    """
+    pg = _as_col(p_green,  bs)
+    pd = _as_col(p_dead,   bs)
+    pc = _as_col(p_clover, bs)
+    pgdm = _as_col(p_gdm,  bs)
+    pt = _as_col(p_total,  bs)
+    return torch.cat([pg, pd, pc, pgdm, pt], dim=1)  # (B,5)
 
 @torch.no_grad()
 def valid_epoch(eval_model, loader, device):
     eval_model.eval()
-    running = 0.0
-    preds_total, preds_gdm, preds_green, preds_clover, preds_dead, all_labels = [
-    ], [], [], [], [], []
-    amp_ctx = (lambda: torch.amp.autocast(device_type='cuda')
-               ) if torch.cuda.is_available() else (lambda: nullcontext())
+
+    n = len(loader.dataset)
+    n_targets = len(CFG.ALL_TARGET_COLS)
+
+    preds_cpu  = torch.empty((n, n_targets), dtype=torch.float32)
+    labels_cpu = torch.empty((n, n_targets), dtype=torch.float32)
+
+    total_loss = 0.0
+    offset = 0
 
     for l, r, lab in loader:
-        l, r, lab = l.to(device, non_blocking=True), r.to(
-            device, non_blocking=True), lab.to(device, non_blocking=True)
-        with amp_ctx():
+        bs = l.size(0)
+        l   = l.to(device, non_blocking=True)
+        r   = r.to(device, non_blocking=True)
+        lab = lab.to(device, non_blocking=True)
+
+        with autocast_ctx():
             p_total, p_gdm, p_green, p_clover, p_dead = eval_model(l, r)
-            loss = biomass_loss(
-                (p_total, p_gdm, p_green, p_clover, p_dead), lab, w=CFG.LOSS_WEIGHTS)
-        running += loss.item() * l.size(0)
-        preds_total.extend(p_total.cpu().numpy().ravel())
-        preds_gdm.extend(p_gdm.cpu().numpy().ravel())
-        preds_green.extend(p_green.cpu().numpy().ravel())
-        preds_clover.extend(p_clover.cpu().numpy().ravel())
-        preds_dead.extend(p_dead.cpu().numpy().ravel())
-        all_labels.extend(lab.cpu().numpy())
+            loss = biomass_loss((p_total, p_gdm, p_green, p_clover, p_dead),
+                                lab, w=CFG.LOSS_WEIGHTS)
 
-    pred_total = np.array(preds_total)
-    pred_gdm = np.array(preds_gdm)
-    pred_green = np.array(preds_green)
-    pred_clover = np.array(preds_clover)
-    pred_dead = np.array(preds_dead)
-    true_labels = np.stack(all_labels)
+        total_loss += loss.detach().float().item() * bs
 
-    pred_all = np.stack(
-        [pred_green, pred_dead, pred_clover, pred_gdm, pred_total], axis=1)
+        batch_pred = _pred_pack(p_total, p_gdm, p_green, p_clover, p_dead, bs).float().cpu()
+        batch_lab  = _ensure_2d_lab(lab, bs).float().cpu()
+
+        # Safety: ensure dims match (avoids silent 4/5 bugs)
+        if batch_pred.shape[1] != n_targets or batch_lab.shape[1] != n_targets:
+            raise RuntimeError(
+                f"Target dim mismatch: pred={batch_pred.shape}, lab={batch_lab.shape}, "
+                f"CFG.ALL_TARGET_COLS={n_targets}"
+            )
+
+        preds_cpu[offset:offset+bs]  = batch_pred
+        labels_cpu[offset:offset+bs] = batch_lab
+        offset += bs
+
+    pred_all    = preds_cpu.numpy()
+    true_labels = labels_cpu.numpy()
     global_r2, avg_r2, per_r2 = weighted_r2_score_global(true_labels, pred_all)
-    return running / len(loader.dataset), global_r2, avg_r2, per_r2, pred_all, true_labels
+    
+    return total_loss / len(loader.dataset), global_r2, avg_r2, per_r2, pred_all, true_labels
 
 
 @torch.no_grad()
 def valid_epoch_tta(eval_model, loaders, device):
+    """
+    Fixed: always accumulate (N,5). Works even if a head outputs (B,1).
+    Assumes each loader iterates in identical order (shuffle=False).
+    """
     eval_model.eval()
-    amp_ctx = (lambda: torch.amp.autocast(device_type='cuda')
-               ) if torch.cuda.is_available() else (lambda: nullcontext())
+    assert len(loaders) > 0
 
-    # We need to aggregate predictions from all loaders
-    # Assuming all loaders have same order and size (which they should if shuffle=False)
+    n = len(loaders[0].dataset)
+    n_targets = len(CFG.ALL_TARGET_COLS)
 
-    all_preds_accum = None
-    all_labels = None
+    labels_cpu = torch.empty((n, n_targets), dtype=torch.float32)
+    preds_sum  = torch.zeros((n, n_targets), dtype=torch.float32)
+
     total_loss = 0.0
 
-    for loader_idx, loader in enumerate(loaders):
-        preds_total, preds_gdm, preds_green, preds_clover, preds_dead = [], [], [], [], []
-        current_labels = []
-        running_loss = 0.0
+    for tta_i, loader in enumerate(loaders):
+        offset = 0
+        tta_loss = 0.0
 
         for l, r, lab in loader:
-            l, r, lab = l.to(device, non_blocking=True), r.to(
-                device, non_blocking=True), lab.to(device, non_blocking=True)
-            with amp_ctx():
+            bs = l.size(0)
+            l   = l.to(device, non_blocking=True)
+            r   = r.to(device, non_blocking=True)
+            lab = lab.to(device, non_blocking=True)
+
+            with autocast_ctx():
                 p_total, p_gdm, p_green, p_clover, p_dead = eval_model(l, r)
-                loss = biomass_loss(
-                    (p_total, p_gdm, p_green, p_clover, p_dead), lab, w=CFG.LOSS_WEIGHTS)
+                loss = biomass_loss((p_total, p_gdm, p_green, p_clover, p_dead),
+                                    lab, w=CFG.LOSS_WEIGHTS)
 
-            running_loss += loss.item() * l.size(0)
+            tta_loss += loss.detach().float().item() * bs
 
-            preds_total.extend(p_total.cpu().numpy().ravel())
-            preds_gdm.extend(p_gdm.cpu().numpy().ravel())
-            preds_green.extend(p_green.cpu().numpy().ravel())
-            preds_clover.extend(p_clover.cpu().numpy().ravel())
-            preds_dead.extend(p_dead.cpu().numpy().ravel())
+            batch_pred = _pred_pack(p_total, p_gdm, p_green, p_clover, p_dead, bs).float().cpu()
+            preds_sum[offset:offset+bs] += batch_pred
 
-            if loader_idx == 0:
-                current_labels.extend(lab.cpu().numpy())
+            if tta_i == 0:
+                batch_lab = _ensure_2d_lab(lab, bs).float().cpu()
+                if batch_lab.shape[1] != n_targets:
+                    raise RuntimeError(f"Label dim mismatch: {batch_lab.shape} vs {n_targets}")
+                labels_cpu[offset:offset+bs] = batch_lab
 
-        total_loss += (running_loss / len(loader.dataset))
+            offset += bs
 
-        # Stack predictions for this loader: (N, 5)
-        # Order: Green, Dead, Clover, GDM, Total (matching CFG.ALL_TARGET_COLS order roughly, but let's be precise)
-        # CFG.ALL_TARGET_COLS = ['Dry_Green_g','Dry_Dead_g','Dry_Clover_g','GDM_g','Dry_Total_g']
-        # preds lists are just raw outputs.
-        # Let's stack them in the order expected by weighted_r2_score_global which expects:
-        # y_true, y_pred where columns match.
-        # The model returns: total, gdm, green, clover, dead
-        # We need to stack them to match true_labels which comes from CFG.ALL_TARGET_COLS
-        # CFG.ALL_TARGET_COLS is ['Dry_Green_g','Dry_Dead_g','Dry_Clover_g','GDM_g','Dry_Total_g']
+        total_loss += tta_loss / n
 
-        pred_stack = np.stack([
-            np.array(preds_green),
-            np.array(preds_dead),
-            np.array(preds_clover),
-            np.array(preds_gdm),
-            np.array(preds_total)
-        ], axis=1)
+    avg_preds   = (preds_sum / len(loaders)).numpy()
+    true_labels = labels_cpu.numpy()
+    global_r2, avg_r2, per_r2 = weighted_r2_score_global(true_labels, avg_preds)
 
-        if all_preds_accum is None:
-            all_preds_accum = pred_stack
-            all_labels = np.stack(current_labels)
-        else:
-            all_preds_accum += pred_stack
-
-    # Average predictions
-    avg_preds = all_preds_accum / len(loaders)
-    avg_loss = total_loss / len(loaders)
-
-    global_r2, avg_r2, per_r2 = weighted_r2_score_global(all_labels, avg_preds)
-    return avg_loss, global_r2, avg_r2, per_r2, avg_preds, all_labels
-
+    return total_loss / len(loaders), global_r2, avg_r2, per_r2, avg_preds, true_labels
 
 def set_backbone_requires_grad(model: BiomassModel, requires_grad: bool):
     for p in model.backbone.parameters():
@@ -668,42 +717,61 @@ def build_scheduler(optimizer):
         e = max(0, epoch - 1)
         if e < CFG.WARMUP_EPOCHS:
             return float(e + 1) / float(max(1, CFG.WARMUP_EPOCHS))
-        progress = (e - CFG.WARMUP_EPOCHS) / \
-            float(max(1, CFG.EPOCHS - CFG.WARMUP_EPOCHS))
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
+        else:
+            progress = (e - CFG.WARMUP_EPOCHS) / float(max(1, CFG.EPOCHS - CFG.WARMUP_EPOCHS))
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
     return LambdaLR(optimizer, lr_lambda)
 
 
 def train_epoch(model, loader, opt, scheduler, device, ema: ModelEmaV2 | None = None):
     model.train()
     running = 0.0
-    opt.zero_grad()
-    amp_ctx = (lambda: torch.amp.autocast(device_type='cuda')
-               ) if torch.cuda.is_available() else (lambda: nullcontext())
+
+    opt.zero_grad(set_to_none=True)
+
     itera = tqdm(loader, desc='train', leave=False) if CFG.USE_TQDM else loader
     for i, (l, r, lab) in enumerate(itera):
-        l, r, lab = l.to(device, non_blocking=True), r.to(
-            device, non_blocking=True), lab.to(device, non_blocking=True)
-        with amp_ctx():
+        bs = l.size(0)
+        l = l.to(device, non_blocking=True)
+        r = r.to(device, non_blocking=True)
+        lab = lab.to(device, non_blocking=True)
+
+        with autocast_ctx():
             total, gdm, green, clover, dead = model(l, r)
-            loss = biomass_loss((total, gdm, green, clover, dead),
-                                lab, w=CFG.LOSS_WEIGHTS) / CFG.GRAD_ACC
-        scaler.scale(loss).backward()
-        running += loss.item() * l.size(0) * CFG.GRAD_ACC
+            loss = biomass_loss((total, gdm, green, clover, dead), lab, w=CFG.LOSS_WEIGHTS) / CFG.GRAD_ACC
+
+        if scaler.is_enabled():
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
+
+        running += loss.item() * bs * CFG.GRAD_ACC
 
         if (i + 1) % CFG.GRAD_ACC == 0 or (i + 1) == len(loader):
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(opt)
-            scaler.update()
+            if scaler.is_enabled():
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(opt)
+                scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+
             if ema is not None:
-                ema.update(model.module if hasattr(model, 'module') else model)
-            opt.zero_grad()
+                ema.update(model.module if hasattr(model, "module") else model)
+
+            opt.zero_grad(set_to_none=True)
     scheduler.step()
     return running / len(loader.dataset)
 
 ############################################################
 # 6️⃣.5-Fold Training Loop with EMA
 ############################################################
+
+# Helper for accurate GPU timings
+def _sync():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
 
 print('Loading data...')
 df_long = pd.read_csv(CFG.TRAIN_CSV)
@@ -726,9 +794,10 @@ oof_true, oof_pred, fold_summary = [], [], []
 
 # Split based on groups (Sampling_Date) and stratification target (State)
 groups = df_wide['Sampling_Date']
+# df_wide['Sampling_Date&State'] = df_wide['Sampling_Date'] + '_' + df_wide['State']
 y_stratify = df_wide['State']
 
-# models_list = [] # Removed to save memory
+models_list = [] # Removed to save memory
 
 for fold, (tr_idx, val_idx) in enumerate(sgkf.split(df_wide, y_stratify, groups=groups)):
     if fold not in CFG.FOLDS_TO_TRAIN:
@@ -737,7 +806,11 @@ for fold, (tr_idx, val_idx) in enumerate(sgkf.split(df_wide, y_stratify, groups=
     print('\n' + '='*70)
     print(f'FOLD {fold+1}/{CFG.N_FOLDS} | {len(tr_idx)} train / {len(val_idx)} val')
     print('='*70)
-    torch.cuda.empty_cache(); gc.collect()
+
+    # NOTE: avoid empty_cache/gc inside epoch loop; only between folds if you really want
+    _sync()
+    torch.cuda.empty_cache()
+    gc.collect()
     
     tr_df  = df_wide.iloc[tr_idx].reset_index(drop=True)
     val_df = df_wide.iloc[val_idx].reset_index(drop=True)
@@ -750,51 +823,60 @@ for fold, (tr_idx, val_idx) in enumerate(sgkf.split(df_wide, y_stratify, groups=
 
     tr_set = BiomassDataset(tr_df,  get_train_transforms(), CFG.TRAIN_IMAGE_DIR)
     
-    # Create TTA loaders
+    # Create TTA loaders (keep TTAs as requested)
     val_loaders = []
     for mode in range(CFG.VAL_TTA_TIMES): # 0: orig, 1: hflip, 2: vflip, 3: rot90
         val_set_tta = BiomassDataset(val_df, get_tta_transforms(mode), CFG.TRAIN_IMAGE_DIR)
-        val_loader_tta = DataLoader(val_set_tta, batch_size=CFG.BATCH_SIZE, shuffle=False, num_workers=CFG.NUM_WORKERS, pin_memory=True)
+        val_loader_tta = DataLoader(val_set_tta, batch_size=CFG.BATCH_SIZE, shuffle=False,
+                                    num_workers=CFG.NUM_WORKERS, pin_memory=True)
         val_loaders.append(val_loader_tta)
 
-    tr_loader  = DataLoader(tr_set, batch_size=CFG.BATCH_SIZE, shuffle=True, num_workers=CFG.NUM_WORKERS, pin_memory=True, drop_last=True)
+    tr_loader  = DataLoader(tr_set, batch_size=CFG.BATCH_SIZE, shuffle=True,
+                            num_workers=CFG.NUM_WORKERS, pin_memory=True, drop_last=True)
     
     print('Building model...')
     backbone_path = getattr(CFG, 'BACKBONE_PATH', None)
-    base_model = BiomassModel(CFG.MODEL_NAME, pretrained=CFG.PRETRAINED, backbone_path=backbone_path).to(CFG.DEVICE)
+    model = BiomassModel(CFG.MODEL_NAME, pretrained=CFG.PRETRAINED, backbone_path=backbone_path).to(CFG.DEVICE)
     
     # Load pretrained fold weights if available (for resuming or fine-tuning)
-    if getattr(CFG, 'PRETRAINED_DIR', None) and os.path.isdir(CFG.PRETRAINED_DIR):
-        pretrained_path = os.path.join(CFG.PRETRAINED_DIR, f'best_model_fold{fold}.pth')
-        if os.path.exists(pretrained_path):
-            try:
-                state = torch.load(pretrained_path, map_location='cpu')
-                # support raw state_dict or dict-with-keys
-                if isinstance(state, dict) and ('model_state_dict' in state or 'state_dict' in state):
-                    key = 'model_state_dict' if 'model_state_dict' in state else 'state_dict'
-                    sd = state[key]
-                else:
-                    sd = state
-                base_model.load_state_dict(sd, strict=False)
-                base_model.to(CFG.DEVICE)
-                print(f'  ✓ Loaded pretrained weights for fold {fold} from {pretrained_path}')
-            except Exception as e:
-                print(f'  ✗ Failed to load pretrained fold {fold}: {e}')
-        else:
-            print(f'  (No pretrained file for fold {fold} at {pretrained_path})')
-    else:
-        print('  (No PRETRAINED_DIR configured or directory missing)')
-        
-    model = nn.DataParallel(base_model)
-    set_backbone_requires_grad(base_model, False)
-    optimizer = build_optimizer(base_model)
+    # if getattr(CFG, 'PRETRAINED_DIR', None) and os.path.isdir(CFG.PRETRAINED_DIR):
+    #     pretrained_path = os.path.join(CFG.PRETRAINED_DIR, f'best_model_fold{fold}.pth')
+    #     if os.path.exists(pretrained_path):
+    #         try:
+    #             state = torch.load(pretrained_path, map_location='cpu')
+    #             # support raw state_dict or dict-with-keys
+    #             if isinstance(state, dict) and ('model_state_dict' in state or 'state_dict' in state):
+    #                 key = 'model_state_dict' if 'model_state_dict' in state else 'state_dict'
+    #                 sd = state[key]
+    #             else:
+    #                 sd = state
+    #             base_model.load_state_dict(sd, strict=False)
+    #             base_model.to(CFG.DEVICE)
+    #             print(f'  ✓ Loaded pretrained weights for fold {fold} from {pretrained_path}')
+    #         except Exception as e:
+    #             print(f'  ✗ Failed to load pretrained fold {fold}: {e}')
+    #     else:
+    #         print(f'  (No pretrained file for fold {fold} at {pretrained_path})')
+    # else:
+    #     print('  (No PRETRAINED_DIR configured or directory missing)')
+    
+    # Single GPU: DO NOT wrap in DataParallel
+    # model = nn.DataParallel(model)  # <-- removed
+
+    # Freeze/unfreeze backbone
+    set_backbone_requires_grad(model, False)
+
+    optimizer = build_optimizer(model)
     scheduler = build_scheduler(optimizer)
-    ema = ModelEmaV2(base_model, decay=CFG.EMA_DECAY)
+
+    # EMA on the real model
+    ema = ModelEmaV2(model, decay=CFG.EMA_DECAY)
     
     best_global_r2 = -np.inf
-    patience = 0
-    best_fold_preds = None; best_fold_true = None
     best_avg_r2 = -np.inf
+    patience = 0
+    best_fold_preds = None
+    best_fold_true = None
     
     # Define save path
     if not os.path.exists(CFG.MODEL_DIR):
@@ -804,14 +886,29 @@ for fold, (tr_idx, val_idx) in enumerate(sgkf.split(df_wide, y_stratify, groups=
     for epoch in range(1, CFG.EPOCHS + 1):
         if epoch == CFG.FREEZE_EPOCHS + 1:
             patience = 0
-            set_backbone_requires_grad(base_model, True)
+            set_backbone_requires_grad(model, True)
             print(f'Epoch {epoch}: backbone unfrozen')
         
+        # ---- Train timing ----
+        # _sync()
+        # t0 = time.perf_counter()
         tr_loss = train_epoch(model, tr_loader, optimizer, scheduler, CFG.DEVICE, ema)
-        eval_model = ema.module if ema is not None else (model.module if hasattr(model, 'module') else model)
+        # _sync()
+        # t1 = time.perf_counter()
+
+        # choose eval model (EMA weights)
+        eval_model = ema.module if ema is not None else model
         
-        # Use TTA validation
+        # ---- Val timing (TTA) ----
+        # _sync()
+        # t2 = time.perf_counter()
         val_loss, global_r2, avg_r2, per_r2, preds_fold, true_fold = valid_epoch_tta(eval_model, val_loaders, CFG.DEVICE)
+        # _sync()
+        # t3 = time.perf_counter()
+
+        # time_tr = t1 - t0
+        # time_val = t3 - t2
+        # time_ep = t3 - t0
         
         per_r2_str = ' | '.join([f'{CFG.ALL_TARGET_COLS[i][:5]}: {r2:.3f}' for i, r2 in enumerate(per_r2)])
         lrs = [pg['lr'] for pg in optimizer.param_groups]
@@ -824,31 +921,36 @@ for fold, (tr_idx, val_idx) in enumerate(sgkf.split(df_wide, y_stratify, groups=
             
             # Save the EMA weights (best state) to disk immediately
             # Clone to CPU to avoid memory issues
-            best_state = {k: v.cpu().clone() for k, v in eval_model.state_dict().items()}
-            torch.save(best_state, save_path)
+            # NOTE: safest is to save state_dict tensors as-is; this is typically fine on DGX.
+            # best_state = {k: v.cpu().clone() for k, v in eval_model.state_dict().items()}
+            torch.save(eval_model.state_dict(), save_path)
             print(f'  → SAVED EMA weights to {save_path} (GlobalR²: {best_global_r2:.4f})')
-            del best_state # Free memory
+            # del best_state # Free memory
             
             patience = 0
-            best_fold_preds = preds_fold; best_fold_true = true_fold
+            best_fold_preds = preds_fold
+            best_fold_true = true_fold
         else:
             patience += 1
             if patience >= CFG.PATIENCE:
-                    print(f'  → EARLY STOP (no improvement in {CFG.PATIENCE} epochs)')
-                    break
+                print(f'  → EARLY STOP (no improvement in {CFG.PATIENCE} epochs)')
+                break
                 
+        # keep memory tidy but avoid heavy cache/gc churn
         del preds_fold, true_fold
-        torch.cuda.empty_cache()
-        gc.collect()
+        # torch.cuda.empty_cache()
+        # gc.collect()
     
     if best_fold_preds is not None:
-        oof_true.append(best_fold_true); oof_pred.append(best_fold_preds)
-        fold_summary.append({'fold': fold, 'global_r2': best_global_r2,'avg_r2':avg_r2})
+        oof_true.append(best_fold_true)
+        oof_pred.append(best_fold_preds)
+        fold_summary.append({'fold': fold, 'global_r2': best_global_r2, 'avg_r2': best_avg_r2})
     
     # Cleanup for this fold
-    del model, base_model, tr_loader, val_loaders, optimizer, scheduler, ema
-    if 'eval_model' in locals(): del eval_model
-    torch.cuda.empty_cache(); gc.collect()
+    del model, tr_loader, val_loaders, optimizer, scheduler, ema, eval_model
+    _sync()
+    torch.cuda.empty_cache()
+    gc.collect()
 
 if oof_true:
     oof_true_arr = np.concatenate(oof_true, axis=0)
@@ -1109,7 +1211,7 @@ def run_inference():
     return final_predictions, filenames
 
 # ===============================================================
-# 9. POST-PROCESS PREDICTIONS
+# 9️⃣. POST-PROCESS PREDICTIONS
 # ===============================================================
 def postprocess_predictions(preds_direct):
     """
@@ -1144,14 +1246,14 @@ def postprocess_predictions(preds_direct):
     print(f"\nPrediction statistics:")
     for i, col in enumerate(CFG.ALL_TARGET_COLS):
         print(f"  {col:15s}: mean={preds_all[:, i].mean():.2f}, "
-              f"std={preds_all[:, i].std():.2f}, "
-              f"min={preds_all[:, i].min():.2f}, "
-              f"max={preds_all[:, i].max():.2f}")
+                            f"std={preds_all[:, i].std():.2f}, "
+                            f"min={preds_all[:, i].min():.2f}, "
+                            f"max={preds_all[:, i].max():.2f}")
     
     return preds_all
 
 # ===============================================================
-# 10. CREATE SUBMISSION FILE (FIXED)
+# 🔟. CREATE SUBMISSION FILE (FIXED)
 # ===============================================================
 def create_submission(predictions, filenames):
     """
@@ -1271,6 +1373,7 @@ def create_submission(predictions, filenames):
 # Run inference
 if CFG.CREATE_SUBMISSION:
     predictions_direct, test_filenames = run_inference()
+    # 后处理，将3个预测值处理为5个
     predictions_all = postprocess_predictions(predictions_direct)
     submission_df = create_submission(predictions_all, test_filenames)
     

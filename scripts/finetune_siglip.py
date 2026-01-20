@@ -22,7 +22,7 @@ import cv2
 
 from transformers import AutoProcessor, AutoImageProcessor, AutoModel, Siglip2Model, Siglip2ImageProcessor, SiglipModel, SiglipImageProcessor
 from transformers import AutoModel, AutoTokenizer
-from sklearn.model_selection import KFold, GroupKFold
+from sklearn.model_selection import KFold, GroupKFold, StratifiedGroupKFold
 from sklearn.linear_model import LinearRegression, Ridge, Lasso, BayesianRidge
 from sklearn.svm import SVR
 from sklearn.ensemble import GradientBoostingRegressor, HistGradientBoostingRegressor, ExtraTreesRegressor
@@ -1153,6 +1153,27 @@ feat_engine = SupervisedEmbeddingEngine(
 # )
 # compare_results(oof_la, train_siglip_df)
 
+
+# below are the parameters for the models
+params_cat = {
+    'iterations': 1900, 'learning_rate': 0.045, 'depth': 4, 'l2_leaf_reg': 0.56, 
+    'random_strength': 0.045, 'bagging_temperature': 0.98, 'verbose': 0, 'random_state': 42,
+    'allow_writing_files': False
+}
+params_xgb = { # Using GradientBoostingRegressor as proxy
+    'n_estimators': 1354, 'learning_rate': 0.010, 'max_depth': 3, 'subsample': 0.60, 
+    'random_state': 42
+}
+params_lgbm = {
+    'n_estimators': 807, 'learning_rate': 0.014, 'num_leaves': 48, 'min_child_samples': 19, 
+    'subsample': 0.745, 'colsample_bytree': 0.745, 'reg_alpha': 0.21, 'reg_lambda': 3.78,
+    'verbose': -1, 'random_state': 42
+}
+params_hist = {
+    'max_iter': 300, 'learning_rate': 0.05, 'max_depth': None, 'l2_regularization': 0.44,
+    'random_state': 42
+}
+
 print("\n###### GradientBoosting Regressor #######")
 oof_gb, pred_test_gb = cross_validate(
     GradientBoostingRegressor(), 
@@ -1175,7 +1196,7 @@ compare_results(oof_hb, train_siglip_df)
 
 print("\n##### CAT Regressor ######")
 oof_cat, pred_test_cat = cross_validate(
-    CatBoostRegressor(verbose=0), 
+    CatBoostRegressor(**params_cat), 
     train_siglip_df, test_siglip_df, 
     feature_engine=feat_engine,
     semantic_train=sem_train_full,
@@ -1195,7 +1216,7 @@ compare_results(oof_cat, train_siglip_df)
 
 print("\n######## LGBM #######")
 oof_lgbm, pred_test_lgbm = cross_validate(
-    LGBMRegressor(verbose=-1), 
+    LGBMRegressor(**params_lgbm), 
     train_siglip_df, test_siglip_df, 
     feature_engine=feat_engine, 
     semantic_train=sem_train_full,

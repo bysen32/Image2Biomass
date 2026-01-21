@@ -403,7 +403,7 @@ class FilmGenerator(nn.Module):
 
     def forward(self, x):
         x = self.mlp(x)
-        gamma, beta = torch.chunk(x, 2, dim=1)
+        gamma, beta = torch.chunk(x, 2, dim=-1)
         return gamma, beta
 
 
@@ -417,7 +417,7 @@ class BiomassModel(nn.Module):
         #    (B, 197, 1024) instead of (B, 1024)
         self.backbone = timm.create_model(self.model_name, pretrained=False, num_classes=0, global_pool='')
 
-        # self.film = FilmGenerator(self.backbone.num_features)
+        self.film = FilmGenerator(self.backbone.num_features)
 
         # 2. Enable Gradient Checkpointing (Crucial for ViT-Large memory!)
         if hasattr(self.backbone, 'set_grad_checkpointing'):
@@ -500,12 +500,13 @@ class BiomassModel(nn.Module):
 
         # 2. Concatenate Left and Right tokens along sequence dimension
         #    (B, N, D) + (B, N, D) -> (B, 2N, D)
-        # context = (x_l + x_r) / 2
-        # gamma, beta = self.film(context)
-        # x_l_modulated = x_l * (1 + gamma) + beta
-        # x_r_modulated = x_r * (1 + gamma) + beta
+        context = (x_l + x_r) / 2
+        gamma, beta = self.film(context)
 
-        x_cat = torch.cat([x_l, x_r], dim=1)
+        x_l_modulated = x_l * (1 + gamma) + beta
+        x_r_modulated = x_r * (1 + gamma) + beta
+
+        x_cat = torch.cat([x_l_modulated, x_r_modulated], dim=1)
 
         # 3. Apply Mamba Fusion
         #    This allows tokens from Left image to interact with tokens from Right image

@@ -1,127 +1,81 @@
-# Main pipeline tuning dinoV3_840m
-############################################################
-# 0️⃣.Init Environment
-############################################################
-import os
-os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
-
-from contextlib import nullcontext
-import pandas as pd
-import cv2
-import math
-import torch.optim as optim
-import torch.nn as nn
-import gc
-import torch
-import time
-import numpy as np
-import seaborn as sns
-import matplotlib.pyplot as plt
-from safetensors.torch import load_file
-from sklearn.model_selection import KFold, StratifiedGroupKFold
-from timm.utils import ModelEmaV2
-from albumentations.pytorch import ToTensorV2
-import albumentations as A
-from torch.utils.data import Dataset, DataLoader
-from torch.optim.lr_scheduler import LambdaLR
+import os, gc, math, cv2, numpy as np, pandas as pd
 from tqdm import tqdm
-import random
-import timm
-print(timm.__version__)
+import torch, torch.nn as nn, torch.optim as optim
+from torch.optim.lr_scheduler import LambdaLR
+from torch.utils.data import Dataset, DataLoader
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+import time
+from timm.utils import ModelEmaV2
+from sklearn.model_selection import KFold, StratifiedGroupKFold
+import matplotlib.pyplot as plt
+import seaborn as sns
 
-IS_KAGGLE = 'KAGGLE_KERNEL_RUN_TYPE' in os.environ
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
+torch.set_float32_matmul_precision("high")
 
-############################################################
-# 1️⃣.Config
-############################################################
 
 
 class CFG:
     CREATE_SUBMISSION = True
-    USE_TQDM = True
-    PRETRAINED_DIR = None
-    PRETRAINED = True 
-    BASE_PATH = '/kaggle/input/csiro-biomass'
-    SEED = 82947501
-    FOLDS_TO_TRAIN = [0, 1, 2, 3, 4]
-    TRAIN_IMAGE_DIR = os.path.join(BASE_PATH, 'train') if IS_KAGGLE else './datasets/csiro-biomass/train'
-    TRAIN_CSV = os.path.join(BASE_PATH, 'train.csv') if IS_KAGGLE else './datasets/csiro-biomass/train.csv'
-    TEST_IMAGE_DIR = '/kaggle/input/csiro-biomass/test' if IS_KAGGLE else './datasets/csiro-biomass/test'
-    TEST_CSV = '/kaggle/input/csiro-biomass/test.csv' if IS_KAGGLE else './datasets/csiro-biomass/test.csv'
-    SUBMISSION_DIR = '/kaggle/working/' if IS_KAGGLE else './save_data'
-    MODEL_DIR = '/kaggle/working/5-folds-dinov3-840m' if IS_KAGGLE else './save_data/5-folds-dinov3-840m-epoch100'
-    MODEL_DIR_012 = '/kaggle/working/5-folds-dinov3-840m' if IS_KAGGLE else './save_data/5-folds-dinov3-840m-epoch100'
-    MODEL_DIR_34 = '/kaggle/working/5-folds-dinov3-840m' if IS_KAGGLE else './save_data/5-folds-dinov3-840m-epoch100'
-    N_FOLDS = 5
+    USE_TQDM        = False
+    PRETRAINED_DIR  = None
+    PRETRAINED      = True
+    BASE_PATH       = '/kaggle/input/csiro-biomass'
+    SEED            = 82947501
+    FOLDS_TO_TRAIN   = [0,1,2,3,4]
+    TRAIN_CSV       = os.path.join(BASE_PATH, 'train.csv')
+    TRAIN_IMAGE_DIR = os.path.join(BASE_PATH, 'train')
+    TEST_IMAGE_DIR = '/kaggle/input/csiro-biomass/test'
+    TEST_CSV = '/kaggle/input/csiro-biomass/test.csv'
+    SUBMISSION_DIR  = './'
+    MODEL_DIR = '/kaggle/input/baseline-dinov3/pytorch/default/1/baseline-dinov3'
+    N_FOLDS         = 5
 
-    # MODEL_NAME      = 'vit_large_patch16_dinov3.lvd1689m'
-    # BACKBONE_PATH   = '/kaggle/input/vit-large-patch16-dinov3-lvd1689m-backbone-pth/vit_large_patch16_dinov3.lvd1689m_backbone.pth'
-    MODEL_NAME = 'vit_huge_plus_patch16_dinov3.lvd1689m'
-    if IS_KAGGLE:
-        BACKBONE_PATH = '/kaggle/input/vit-huge-plus-patch16-dinov3/pytorch/default/1/vit_huge_plus_patch16_dinov3.lvd1689m.safetensors'
-        # BACKBONE_PATH = '/kaggle/input/vit-huge-plus-patch16-dinov3-lvd1689m/vit_huge_plus_patch16_dinov3.lvd1689m_backbone.pth'
-    else:
-        BACKBONE_PATH = './pretrained_models/vit-huge-plus-patch16-dinov3/vit_huge_plus_patch16_dinov3.lvd1689m_backbone.safetensors'
-        # BACKBONE_PATH = None
+    MODEL_NAME      = 'vit_huge_plus_patch16_dinov3.lvd1689m'
+    BACKBONE_PATH   = '/kaggle/input/vit-huge-plus-patch16-dinov3-lvd1689m/vit_huge_plus_patch16_dinov3.lvd1689m_backbone.pth'
+    DINO_GRAD_CHECKPOINTING = False
 
-    DINO_GRADE_CHECKPOINTING = False
+    IMG_SIZE        = 512
 
-    IMG_SIZE = 512
+    VAL_TTA_TIMES   = 1
+    TTA_STEPS       = 1
+    
+    
+    BATCH_SIZE      = 1
+    GRAD_ACC        = 4
+    NUM_WORKERS     = 4
+    EPOCHS          = 1
+    FREEZE_EPOCHS   = 0
+    WARMUP_EPOCHS   = 3
+    LR_REST         = 1e-3
+    LR_BACKBONE     = 5e-4
+    WD              = 1e-2
+    EMA_DECAY       = 0.9
+    CLIP_GRAD_NORM  = 1.0
+    PATIENCE        = 5
+    TARGET_COLS     = ['Dry_Total_g', 'GDM_g', 'Dry_Green_g']
+    DERIVED_COLS    = ['Dry_Clover_g', 'Dry_Dead_g']
+    ALL_TARGET_COLS = ['Dry_Green_g','Dry_Dead_g','Dry_Clover_g','GDM_g','Dry_Total_g']
+    R2_WEIGHTS      = np.array([0.1, 0.1, 0.1, 0.2, 0.5])
+    LOSS_WEIGHTS    = np.array([0.1, 0.1, 0.1, 0.0, 0.0])
+    DEVICE          = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    VAL_TTA_TIMES = 1
-    TTA_STEPS = 1 # 测试增强
-
-    BATCH_SIZE = 1
-    GRAD_ACC = 4
-    NUM_WORKERS = 4
-    EPOCHS = 100
-    FREEZE_EPOCHS = 0
-    WARMUP_EPOCHS = 5
-    LR_REST = 1e-3
-    LR_BACKBONE = 5e-4
-    WD = 1e-2
-    EMA_DECAY = 0.9
-    PATIENCE = 5
-    TARGET_COLS = ['Dry_Total_g', 'GDM_g', 'Dry_Green_g']
-    DERIVED_COLS = ['Dry_Clover_g', 'Dry_Dead_g']
-    ALL_TARGET_COLS = ['Dry_Green_g', 'Dry_Dead_g', 'Dry_Clover_g', 'GDM_g', 'Dry_Total_g']
-    R2_WEIGHTS = np.array([0.1, 0.1, 0.1, 0.2, 0.5])
-    LOSS_WEIGHTS = np.array([0.1, 0.1, 0.1, 0.0, 0.0])
-    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-
-def seeding(SEED):
-    np.random.seed(SEED)
-    random.seed(SEED)
-    os.environ['PYTHONHASHSEED'] = str(SEED)
-    torch.manual_seed(SEED)
-    # pl.seed_everything(SEED)
-    if torch.cuda.is_available(): 
-        torch.cuda.manual_seed(SEED)
-        torch.cuda.manual_seed_all(SEED)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-    print('seeding done!!!')
-
-seeding(CFG.SEED)
-
+os.makedirs(CFG.MODEL_DIR, exist_ok=True)
 print(f'Device : {CFG.DEVICE}')
 print(f'Backbone: {CFG.MODEL_NAME} | Input: {CFG.IMG_SIZE}')
 print(f'Freeze Epochs: {CFG.FREEZE_EPOCHS} | Warmup: {CFG.WARMUP_EPOCHS}')
 print(f'EMA Decay: {CFG.EMA_DECAY} | Grad Acc: {CFG.GRAD_ACC}')
 
 
-
-##################################
-# 2️⃣.Metrics
-############################################################
-
+# Metrics
 def weighted_r2_score(y_true: np.ndarray, y_pred: np.ndarray):
     weights = CFG.R2_WEIGHTS
     r2_scores = []
     for i in range(y_true.shape[1]):
-        yt = y_true[:, i]
-        yp = y_pred[:, i]
+        yt = y_true[:, i]; yp = y_pred[:, i]
         ss_res = np.sum((yt - yp) ** 2)
         ss_tot = np.sum((yt - np.mean(yt)) ** 2)
         r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
@@ -146,25 +100,46 @@ def analyze_errors(val_df, y_true, y_pred, targets, top_n=5):
     print(f'\n--- Top {top_n} High Loss Samples per Target ---')
     y_true = np.array(y_true)
     y_pred = np.array(y_pred)
-
+    
     for i, target in enumerate(targets):
         errors = np.abs(y_true[:, i] - y_pred[:, i])
         top_indices = np.argsort(errors)[::-1][:top_n]
-
+        
         print(f'\nTarget: {target}')
-        print(
-            f'{"Index":<6} | {"Image Path":<40} | {"True":<10} | {"Pred":<10} | {"AbsErr":<10}')
+        print(f'{"Index":<6} | {"Image Path":<40} | {"True":<10} | {"Pred":<10} | {"AbsErr":<10}')
         print('-' * 90)
-
+        
         for idx in top_indices:
             path = val_df.iloc[idx]['image_path']
             path_disp = os.path.basename(path)
             t_val = y_true[idx, i]
             p_val = y_pred[idx, i]
             err = errors[idx]
-            print(
-                f'{idx:<6} | {path_disp:<40} | {t_val:<10.4f} | {p_val:<10.4f} | {err:<10.4f}')
+            print(f'{idx:<6} | {path_disp:<40} | {t_val:<10.4f} | {p_val:<10.4f} | {err:<10.4f}')
 
+
+def analyze_errors(val_df, y_true, y_pred, targets, top_n=5):
+    print(f'\n--- Top {top_n} High Loss Samples per Target ---')
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+    
+    for i, target in enumerate(targets):
+        errors = np.abs(y_true[:, i] - y_pred[:, i])
+        top_indices = np.argsort(errors)[::-1][:top_n]
+        
+        print(f'\nTarget: {target}')
+        header = f'{"Index":<6} | {"Image Path":<40} | {"State":<6} | {"True":<10} | {"Pred":<10} | {"AbsErr":<10}'
+        print(header)
+        print('-' * len(header))
+        
+        for idx in top_indices:
+            path = val_df.iloc[idx]['image_path']
+            path_disp = os.path.basename(path)
+            state = val_df.iloc[idx]['State'] if 'State' in val_df.columns else 'NA'
+            t_val = y_true[idx, i]
+            p_val = y_pred[idx, i]
+            err = errors[idx]
+            print(f'{idx:<6} | {path_disp:<40} | {str(state):<6} | {t_val:<10.4f} | {p_val:<10.4f} | {err:<10.4f}')
 def compare_train_val(tr_df, val_df, targets, show_plots=True):
     """Quick comparison of target distributions and metadata between train and val splits."""
     print("\n--- Train / Val Comparison ---")
@@ -173,10 +148,8 @@ def compare_train_val(tr_df, val_df, targets, show_plots=True):
         tr = tr_df.get(t, pd.Series(dtype=float)).dropna()
         val = val_df.get(t, pd.Series(dtype=float)).dropna()
         print(f"\nTarget: {t}")
-        print(
-            f"  Train: n={len(tr)} mean={tr.mean():.3f} std={tr.std():.3f} min={tr.min():.3f} max={tr.max():.3f}")
-        print(
-            f"  Val  : n={len(val)} mean={val.mean():.3f} std={val.std():.3f} min={val.min():.3f} max={val.max():.3f}")
+        print(f"  Train: n={len(tr)} mean={tr.mean():.3f} std={tr.std():.3f} min={tr.min():.3f} max={tr.max():.3f}")
+        print(f"  Val  : n={len(val)} mean={val.mean():.3f} std={val.std():.3f} min={val.min():.3f} max={val.max():.3f}")
         if show_plots:
             try:
                 plt.figure(figsize=(6, 3))
@@ -192,43 +165,56 @@ def compare_train_val(tr_df, val_df, targets, show_plots=True):
     if 'Sampling_Date' in tr_df.columns:
         try:
             tr_dates = pd.to_datetime(tr_df['Sampling_Date'], errors='coerce')
-            val_dates = pd.to_datetime(
-                val_df['Sampling_Date'], errors='coerce')
+            val_dates = pd.to_datetime(val_df['Sampling_Date'], errors='coerce')
             print("\nSampling_Date range:")
-            print(
-                f"  Train: {tr_dates.min()} -> {tr_dates.max()} (missing {tr_dates.isna().sum()})")
-            print(
-                f"  Val  : {val_dates.min()} -> {val_dates.max()} (missing {val_dates.isna().sum()})")
+            print(f"  Train: {tr_dates.min()} -> {tr_dates.max()} (missing {tr_dates.isna().sum()})")
+            print(f"  Val  : {val_dates.min()} -> {val_dates.max()} (missing {val_dates.isna().sum()})")
         except Exception as e:
             print('  Could not parse Sampling_Date:', e)
     if 'State' in tr_df.columns:
         print("\nState distribution (train vs val):")
         tr_state = tr_df['State'].value_counts(normalize=True)
         val_state = val_df['State'].value_counts(normalize=True)
-        state_df = pd.concat([tr_state, val_state], axis=1,
-                             keys=['train', 'val']).fillna(0)
+        state_df = pd.concat([tr_state, val_state], axis=1, keys=['train', 'val']).fillna(0)
 
         print(state_df)
 
+    
+def biomass_loss(outputs, labels, w=None):
+    total, gdm, green, clover, dead = outputs
+    mse = nn.MSELoss()
+    huber = nn.SmoothL1Loss(beta=5.0) # Huber loss for robust regression (beta=5.0 as recommended)
+    
+    l_green  = huber(green.squeeze(),  labels[:,0])
+    l_dead   = huber(dead.squeeze(), labels[:,1]) # Use Huber loss for Dead
+    l_clover = huber(clover.squeeze(), labels[:,2])
+    l_gdm    = huber(gdm.squeeze(),    labels[:,3])
+    l_total  = huber(total.squeeze(),  labels[:,4])
 
-############################################################
-# 3️⃣.Dataset & Augmentation
-############################################################
+    # Stack per-target losses in the SAME order as CFG.ALL_TARGET_COLS
+    losses = torch.stack([l_green, l_dead, l_clover, l_gdm, l_total])
+    # losses = torch.stack([l_green, l_dead, l_clover])
 
+    # Use provided weights, or default to CFG.R2_WEIGHTS
+    if w is None:
+        return losses.mean()
+    w = torch.as_tensor(w, device=losses.device, dtype=losses.dtype)
+    w = w / w.sum()
+    return (losses * w).sum()
+
+
+# Transforms
 def get_train_transforms():
     return A.Compose([
         A.Resize(CFG.IMG_SIZE, CFG.IMG_SIZE),
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.5),
         A.RandomRotate90(p=0.5),
-        A.Rotate(limit=(-10, 10), p=0.3, interpolation=cv2.INTER_LINEAR,
-                 border_mode=cv2.BORDER_REFLECT_101),
-        A.ColorJitter(brightness=0.1, contrast=0.1,
-                      saturation=0.1, hue=0.05, p=0.5),
+        A.Rotate(limit=(-10, 10), p=0.3, interpolation=cv2.INTER_LINEAR, border_mode=cv2.BORDER_REFLECT_101),
+        A.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05, p=0.5),
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2()
     ], p=1.0)
-
 
 def get_val_transforms():
     return A.Compose([
@@ -236,7 +222,6 @@ def get_val_transforms():
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2()
     ], p=1.0)
-
 
 def get_tta_transforms(mode=0):
     # mode 0: original
@@ -246,15 +231,14 @@ def get_tta_transforms(mode=0):
     transforms_list = [
         A.Resize(CFG.IMG_SIZE, CFG.IMG_SIZE),
     ]
-
+    
     if mode == 1:
         transforms_list.append(A.HorizontalFlip(p=1.0))
     elif mode == 2:
         transforms_list.append(A.VerticalFlip(p=1.0))
     elif mode == 3:
-        # RandomRotate90 with p=1.0 rotates 90, 180, 270 randomly?
-        transforms_list.append(A.RandomRotate90(p=1.0))
-        # Albumentations RandomRotate90 rotates by 90, 180, 270.
+        transforms_list.append(A.RandomRotate90(p=1.0)) # RandomRotate90 with p=1.0 rotates 90, 180, 270 randomly? 
+        # Albumentations RandomRotate90 rotates by 90, 180, 270. 
         # Reference uses transforms.RandomRotation([90, 90]) which is exactly 90 degrees.
         # To match exactly 90 degrees in Albumentations, we might need Rotate(limit=(90,90), p=1.0)
         # But RandomRotate90 is standard TTA. Let's use Rotate(limit=(90,90)) to be precise if that's what reference does.
@@ -265,7 +249,7 @@ def get_tta_transforms(mode=0):
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2()
     ])
-
+    
     return A.Compose(transforms_list, p=1.0)
 
 
@@ -273,7 +257,7 @@ def clean_image(img):
     # 1. Safe Crop (Remove artifacts at the bottom)
     h, w = img.shape[:2]
     # Cut bottom 10% where artifacts often appear
-    img = img[0:int(h*0.90), :]
+    img = img[0:int(h*0.90), :] 
 
     # 2. Inpaint Date Stamp (Remove orange text)
     hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
@@ -283,7 +267,7 @@ def clean_image(img):
     mask = cv2.inRange(hsv, lower, upper)
 
     # Dilate mask to cover text edges and reduce noise
-    mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=2)
+    mask = cv2.dilate(mask, np.ones((3,3), np.uint8), iterations=2)
 
     # Inpaint if mask is not empty
     if np.sum(mask) > 0:
@@ -308,7 +292,6 @@ class BiomassDataset(Dataset):
         img = cv2.imread(path)
         if img is None:
             img = np.zeros((1000, 2000, 3), dtype=np.uint8)
-
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         img = clean_image(img)
         h, w, _ = img.shape
@@ -319,58 +302,20 @@ class BiomassDataset(Dataset):
         right = self.transform(image=right)['image']
         label = torch.from_numpy(self.labels[idx])
         return left, right, label
-
-
-############################################################
-# 4️⃣.Model
-############################################################
-
-# class BiomassModel(nn.Module):
-#     def __init__(self, model_name, pretrained=True):
-#         super().__init__()
-#         self.model_name = model_name
-#         self.backbone = timm.create_model(self.model_name, pretrained=False, num_classes=0, global_pool='avg')
-#         nf = self.backbone.num_features
-#         comb = nf * 2
-#         self.head_green_raw  = nn.Sequential(nn.Linear(comb, comb//2), nn.GELU(), nn.Dropout(0.3), nn.Linear(comb//2, 1))
-#         self.head_clover_raw = nn.Sequential(nn.Linear(comb, comb//2), nn.GELU(), nn.Dropout(0.3), nn.Linear(comb//2, 1))
-#         self.head_dead_raw   = nn.Sequential(nn.Linear(comb, comb//2), nn.GELU(), nn.Dropout(0.3), nn.Linear(comb//2, 1))
-#         if pretrained:
-#             self.load_pretrained()
-
-#     def load_pretrained(self):
-#         try:
-#             sd = timm.create_model(self.model_name, pretrained=True, num_classes=0, global_pool='avg').state_dict()
-#             self.backbone.load_state_dict(sd, strict=False)
-#             print('Pretrained weights loaded.')
-#         except Exception as e:
-#             print(f'Warning: pretrained load failed: {e}')
-
-#     def forward(self, left, right):
-#         fl = self.backbone(left)
-#         fr = self.backbone(right)
-#         x  = torch.cat([fl, fr], dim=1)
-#         green  = self.head_green_raw(x)
-#         # clover = torch.nn.functional.softplus(self.head_clover_raw(x))
-#         # dead   = torch.nn.functional.softplus(self.head_dead_raw(x))
-#         clover = self.head_clover_raw(x)
-#         dead   = self.head_dead_raw(x)
-#         gdm    = green + clover
-#         total  = gdm + dead
-#         return total, gdm, green, clover, dead
-
+    
+    
+    
+# Layers
 class LocalMambaBlock(nn.Module):
     """
     Lightweight Mamba-style block (Gated CNN) from the reference notebook.
     Efficiently mixes tokens with linear complexity.
     """
-
     def __init__(self, dim, kernel_size=5, dropout=0.0):
         super().__init__()
         self.norm = nn.LayerNorm(dim)
         # Depthwise conv mixes spatial information locally
-        self.dwconv = nn.Conv1d(
-            dim, dim, kernel_size=kernel_size, padding=kernel_size // 2, groups=dim)
+        self.dwconv = nn.Conv1d(dim, dim, kernel_size=kernel_size, padding=kernel_size // 2, groups=dim)
         self.gate = nn.Linear(dim, dim)
         self.proj = nn.Linear(dim, dim)
         self.drop = nn.Dropout(dropout)
@@ -390,187 +335,163 @@ class LocalMambaBlock(nn.Module):
         x = self.proj(x)
         x = self.drop(x)
         return shortcut + x
-
-
-class FilmGenerator(nn.Module):
-    def __init__(self, feat_dim):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(feat_dim, feat_dim // 2), 
-            nn.ReLU(inplace=True), 
-            nn.Linear(feat_dim // 2, feat_dim * 2)
-        )
-
-    def forward(self, x):
-        x = self.mlp(x)
-        gamma, beta = torch.chunk(x, 2, dim=-1)
-        return gamma, beta
-
-
+    
+    
+# Model
 class BiomassModel(nn.Module):
     def __init__(self, model_name, pretrained=True, backbone_path=None):
         super().__init__()
         self.model_name = model_name
         self.backbone_path = backbone_path
-
+        
         # 1. Load Backbone with global_pool='' to keep patch tokens
         #    (B, 197, 1024) instead of (B, 1024)
         self.backbone = timm.create_model(self.model_name, pretrained=False, num_classes=0, global_pool='')
-
-        self.film = FilmGenerator(self.backbone.num_features)
-
+        
         # 2. Enable Gradient Checkpointing (Crucial for ViT-Large memory!)
-        if hasattr(self.backbone, 'set_grad_checkpointing'):
+        if hasattr(self.backbone, 'set_grad_checkpointing') and CFG.DINO_GRAD_CHECKPOINTING:
             self.backbone.set_grad_checkpointing(True)
             print("✓ Gradient Checkpointing enabled (saves ~50% VRAM)")
-
+            
         nf = self.backbone.num_features
-
         
-        # 定义一个简单的 MLP 来生成 FiLM 参数 gamma 和 beta
-        # self.film_generator = nn.Sequential(
-        #     nn.Linear(2, 32),
-        #     nn.ReLU(),
-        #     nn.Linear(32, 2 * 8)
-        # )
-
         # 3. Mamba Fusion Neck
         #    Mixes the concatenated tokens [Left, Right]
         self.fusion = nn.Sequential(
             LocalMambaBlock(nf, kernel_size=5, dropout=0.1),
             LocalMambaBlock(nf, kernel_size=5, dropout=0.1)
         )
-
+        
         # 4. Pooling & Heads
         self.pool = nn.AdaptiveAvgPool1d(1)
-
-        def make_head():
-            return nn.Sequential(
-                nn.Linear(nf, nf//2), nn.GELU(), nn.Dropout(0.2),
-                nn.Linear(nf//2, 1), nn.Softplus()
-            )
-
+        
         # Heads (using the same logic as before, but on fused features)
-        self.head_green_raw = make_head()
-        self.head_clover_raw = make_head()
-        self.head_dead_raw = make_head()
-
+        self.head_green_raw  = nn.Sequential(
+            nn.Linear(nf, nf//2), nn.GELU(), nn.Dropout(0.2), 
+            nn.Linear(nf//2, 1), nn.Softplus()
+        )
+        self.head_clover_raw = nn.Sequential(
+            nn.Linear(nf, nf//2), nn.GELU(), nn.Dropout(0.2), 
+            nn.Linear(nf//2, 1), nn.Softplus()
+        )
+        self.head_dead_raw   = nn.Sequential(
+            nn.Linear(nf, nf//2), nn.GELU(), nn.Dropout(0.2), 
+            nn.Linear(nf//2, 1), nn.Softplus()
+        )
+        
         if pretrained:
             self.load_pretrained()
-
+    
     def load_pretrained(self):
         try:
             # Load weights normally
             if self.backbone_path and os.path.exists(self.backbone_path):
-                print(
-                    f"Loading backbone weights from local file: {self.backbone_path}")
-                if self.backbone_path.endswith('.pth'):
-                    sd = torch.load(self.backbone_path, map_location='cpu')
-                    # Handle common checkpoint wrappers (e.g. if saved with 'model' key)
-                    if 'model' in sd: sd = sd['model']
-                    elif 'state_dict' in sd: sd = sd['state_dict']
-                elif self.backbone_path.endswith('.safetensors'):
-                    sd = load_file(self.backbone_path)
+                print(f"Loading backbone weights from local file: {self.backbone_path}")
+                sd = torch.load(self.backbone_path, map_location='cpu')
+                # Handle common checkpoint wrappers (e.g. if saved with 'model' key)
+                if 'model' in sd: sd = sd['model']
+                elif 'state_dict' in sd: sd = sd['state_dict']
             else:
                 # Original behavior: Download from internet
                 print("Downloading backbone weights...")
                 sd = timm.create_model(self.model_name, pretrained=True, num_classes=0, global_pool='').state_dict()
-
+            
             # Interpolate pos_embed if needed (for 256x256 vs 224x224)
             if 'pos_embed' in sd and hasattr(self.backbone, 'pos_embed'):
                 pe_ck = sd['pos_embed']
-                pe_m = self.backbone.pos_embed
+                pe_m  = self.backbone.pos_embed
                 if pe_ck.shape != pe_m.shape:
-                    print(
-                        f"Interpolating pos_embed: {pe_ck.shape} -> {pe_m.shape}")
+                    print(f"Interpolating pos_embed: {pe_ck.shape} -> {pe_m.shape}")
                     # (Simple interpolation logic here or rely on timm's load if strict=False handles it well enough)
                     # For robust interpolation, use the snippet provided in previous turn
-
+            
             self.backbone.load_state_dict(sd, strict=False)
             print('Pretrained weights loaded.')
         except Exception as e:
             print(f'Warning: pretrained load failed: {e}')
-
+    
     def forward(self, left, right):
         # 1. Extract Tokens (B, N, D)
         #    Note: ViT usually returns [CLS, Patch1, Patch2...]
         #    We remove CLS token for spatial mixing, or keep it. Let's keep it.
         x_l = self.backbone(left)
         x_r = self.backbone(right)
-
+        
         # 2. Concatenate Left and Right tokens along sequence dimension
         #    (B, N, D) + (B, N, D) -> (B, 2N, D)
-        context = (x_l + x_r) / 2
-        gamma, beta = self.film(context)
-
-        x_l_modulated = x_l * (1 + gamma) + beta
-        x_r_modulated = x_r * (1 + gamma) + beta
-
-        x_cat = torch.cat([x_l_modulated, x_r_modulated], dim=1)
-
+        x_cat = torch.cat([x_l, x_r], dim=1)
+        
         # 3. Apply Mamba Fusion
         #    This allows tokens from Left image to interact with tokens from Right image
         x_fused = self.fusion(x_cat)
-
+        
         # 4. Global Pooling
         #    (B, 2N, D) -> (B, D, 2N) -> (B, D, 1) -> (B, D)
         x_pool = self.pool(x_fused.transpose(1, 2)).flatten(1)
-
+        
         # 5. Prediction Heads
-        green = self.head_green_raw(x_pool)
+        green  = self.head_green_raw(x_pool)
         clover = self.head_clover_raw(x_pool)
-        dead = self.head_dead_raw(x_pool)
-
+        dead   = self.head_dead_raw(x_pool)
+        
         # Summation logic
-        gdm = green + clover
-        total = gdm + dead
-
+        gdm    = green + clover
+        total  = gdm + dead
+        
         return total, gdm, green, clover, dead
+    
+    
+    # Utility Functions
+def set_backbone_requires_grad(model: BiomassModel, requires_grad: bool):
+    for p in model.backbone.parameters():
+        p.requires_grad = requires_grad
 
-############################################################
-# Loss
-############################################################
 
+def build_optimizer(model: BiomassModel):
+    # 1. Get backbone parameter IDs for exclusion
+    backbone_ids = {id(p) for p in model.backbone.parameters()}
+    
+    # 2. Separate params into backbone vs. everything else (heads, fusion, etc.)
+    backbone_params = []
+    rest_params = []
+    
+    for p in model.parameters():
+        if p.requires_grad:
+            if id(p) in backbone_ids:
+                backbone_params.append(p)
+            else:
+                rest_params.append(p)
+    
+    return optim.AdamW([
+        {'params': backbone_params, 'lr': CFG.LR_BACKBONE, 'weight_decay': CFG.WD},
+        {'params': rest_params,     'lr': CFG.LR_REST,     'weight_decay': CFG.WD},
+])
 
-def biomass_loss(outputs, labels, w=None):
-    total, gdm, green, clover, dead = outputs
-    mse = nn.MSELoss()
-    # Huber loss for robust regression (beta=5.0 as recommended)
-    huber = nn.SmoothL1Loss(beta=5.0)
+def build_scheduler(optimizer):
+    def lr_lambda(epoch):
+        e = max(0, epoch - 1)
+        if e < CFG.WARMUP_EPOCHS:
+            return float(e + 1) / float(max(1, CFG.WARMUP_EPOCHS))
+        progress = (e - CFG.WARMUP_EPOCHS) / float(max(1, CFG.EPOCHS - CFG.WARMUP_EPOCHS))
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+    return LambdaLR(optimizer, lr_lambda)
+# Training and Validation Loops 
 
-    l_green = huber(green.squeeze(dim=0),  labels[:, 0])
-    l_dead = huber(dead.squeeze(dim=0), labels[:, 1])  # Use Huber loss for Dead
-    l_clover = huber(clover.squeeze(dim=0), labels[:, 2])
-    l_gdm = huber(gdm.squeeze(dim=0),    labels[:, 3])
-    l_total = huber(total.squeeze(dim=0),  labels[:, 4])
+from contextlib import nullcontext
 
-    # Stack per-target losses in the SAME order as CFG.ALL_TARGET_COLS
-    losses = torch.stack([l_green, l_dead, l_clover, l_gdm, l_total])
-    # losses = torch.stack([l_green, l_dead, l_clover])
-
-    # Use provided weights, or default to CFG.R2_WEIGHTS
-    if w is None:
-        return losses.mean()
-    w = torch.as_tensor(w, device=losses.device, dtype=losses.dtype)
-    w = w / w.sum()
-    return (losses * w).sum()
-
-############################################################
-# 5️⃣.Train Functions with EMA & Gradient Accumulation
-############################################################
 USE_BF16 = True
 AMP_DTYPE = torch.bfloat16 if USE_BF16 else torch.float16
 
+scaler = torch.amp.GradScaler(
+    'cuda',
+    enabled=(torch.cuda.is_available() and AMP_DTYPE == torch.float16)
+)
 
-scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
-
-# 启用混合精度训练
 def autocast_ctx():
     if not torch.cuda.is_available():
         return nullcontext()
     return torch.amp.autocast(device_type='cuda', dtype=AMP_DTYPE)
 
-# 将预测转换为列向量
 def _as_col(x: torch.Tensor, bs: int) -> torch.Tensor:
     """Force predictions to (B,1) regardless of model head returning (B,) or (B,1)."""
     if x.ndim == 1:
@@ -579,7 +500,6 @@ def _as_col(x: torch.Tensor, bs: int) -> torch.Tensor:
         return x
     return x.view(bs, 1)
 
-# 确保标签为二维张量
 def _ensure_2d_lab(lab: torch.Tensor, bs: int) -> torch.Tensor:
     """Force labels to (B,T)."""
     if lab.ndim == 1:
@@ -598,7 +518,7 @@ def _pred_pack(p_total, p_gdm, p_green, p_clover, p_dead, bs: int) -> torch.Tens
     pt = _as_col(p_total,  bs)
     return torch.cat([pg, pd, pc, pgdm, pt], dim=1)  # (B,5)
 
-@torch.no_grad()
+@torch.inference_mode()
 def valid_epoch(eval_model, loader, device):
     eval_model.eval()
 
@@ -641,11 +561,11 @@ def valid_epoch(eval_model, loader, device):
     pred_all    = preds_cpu.numpy()
     true_labels = labels_cpu.numpy()
     global_r2, avg_r2, per_r2 = weighted_r2_score_global(true_labels, pred_all)
-    
-    return total_loss / len(loader.dataset), global_r2, avg_r2, per_r2, pred_all, true_labels
+
+    return total_loss / n, global_r2, avg_r2, per_r2, pred_all, true_labels
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def valid_epoch_tta(eval_model, loaders, device):
     """
     Fixed: always accumulate (N,5). Works even if a head outputs (B,1).
@@ -698,79 +618,41 @@ def valid_epoch_tta(eval_model, loaders, device):
 
     return total_loss / len(loaders), global_r2, avg_r2, per_r2, avg_preds, true_labels
 
-def set_backbone_requires_grad(model: BiomassModel, requires_grad: bool):
-    for p in model.backbone.parameters():
-        p.requires_grad = requires_grad
-
-
-def build_optimizer(model: BiomassModel):
-    head_params = (list(model.head_green_raw.parameters()) +
-                   list(model.head_clover_raw.parameters()) +
-                   list(model.head_dead_raw.parameters()))
-    backbone_params = list(model.backbone.parameters())
-    return optim.AdamW([
-        {'params': backbone_params, 'lr': CFG.LR_BACKBONE, 'weight_decay': CFG.WD},
-        {'params': head_params,     'lr': CFG.LR_HEAD,     'weight_decay': CFG.WD},
-    ])
-
-
-def build_optimizer(model: BiomassModel):
-    # 1. Get backbone parameter IDs for exclusion
-    backbone_ids = {id(p) for p in model.backbone.parameters()}
-
-    # 2. Separate params into backbone vs. everything else (heads, fusion, etc.)
-    backbone_params = []
-    rest_params = []
-
-    for p in model.parameters():
-        if p.requires_grad:
-            if id(p) in backbone_ids:
-                backbone_params.append(p)
-            else:
-                rest_params.append(p)
-
-    return optim.AdamW([
-        {'params': backbone_params, 'lr': CFG.LR_BACKBONE, 'weight_decay': CFG.WD},
-        {'params': rest_params,     'lr': CFG.LR_REST,     'weight_decay': CFG.WD},
-    ])
-
-
-def build_scheduler(optimizer):
-    def lr_lambda(epoch):
-        e = max(0, epoch - 1)
-        if e < CFG.WARMUP_EPOCHS:
-            return float(e + 1) / float(max(1, CFG.WARMUP_EPOCHS))
-        else:
-            progress = (e - CFG.WARMUP_EPOCHS) / float(max(1, CFG.EPOCHS - CFG.WARMUP_EPOCHS))
-            return 0.5 * (1.0 + math.cos(math.pi * progress))
-    return LambdaLR(optimizer, lr_lambda)
-
 
 def train_epoch(model, loader, opt, scheduler, device, ema: ModelEmaV2 | None = None):
     model.train()
     running = 0.0
 
     opt.zero_grad(set_to_none=True)
-
     itera = tqdm(loader, desc='train', leave=False) if CFG.USE_TQDM else loader
+
     for i, (l, r, lab) in enumerate(itera):
         bs = l.size(0)
-        l = l.to(device, non_blocking=True)
-        r = r.to(device, non_blocking=True)
+        l   = l.to(device, non_blocking=True)
+        r   = r.to(device, non_blocking=True)
         lab = lab.to(device, non_blocking=True)
 
         with autocast_ctx():
-            total, gdm, green, clover, dead = model(l, r)
-            loss = biomass_loss((total, gdm, green, clover, dead), lab, w=CFG.LOSS_WEIGHTS) / CFG.GRAD_ACC
+            p_total, p_gdm, p_green, p_clover, p_dead = model(l, r)
+            loss = biomass_loss((p_total, p_gdm, p_green, p_clover, p_dead),
+                                lab, w=CFG.LOSS_WEIGHTS)
+            loss = loss / CFG.GRAD_ACC
+
+
+        if not torch.isfinite(loss):
+            print("Non-finite loss detected; skipping batch")
+            opt.zero_grad(set_to_none=True)
+            continue
 
         if scaler.is_enabled():
             scaler.scale(loss).backward()
         else:
             loss.backward()
 
-        running += loss.item() * bs * CFG.GRAD_ACC
+        running += loss.detach().float().item() * bs * CFG.GRAD_ACC
 
-        if (i + 1) % CFG.GRAD_ACC == 0 or (i + 1) == len(loader):
+        do_step = ((i + 1) % CFG.GRAD_ACC == 0) or ((i + 1) == len(loader))
+        if do_step:
             if scaler.is_enabled():
                 scaler.unscale_(opt)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -784,237 +666,14 @@ def train_epoch(model, loader, opt, scheduler, device, ema: ModelEmaV2 | None = 
                 ema.update(model.module if hasattr(model, "module") else model)
 
             opt.zero_grad(set_to_none=True)
+
     scheduler.step()
     return running / len(loader.dataset)
 
-############################################################
-# 6️⃣.5-Fold Training Loop with EMA
-############################################################
 
-class EarlyStopping:
-    def __init__(self, patience=5, min_delta=1e-4):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.counter = 0
-        self.best_score = None
 
-    def step(self, score):
-        if self.best_score is None or score < self.best_score - self.min_delta:
-            self.best_score = score
-            self.counter = 0
-            return True
-        else:
-            self.counter += 1
-            return False
+# Inference   
 
-    def should_stop(self):
-        return self.counter >= self.patience
-    
-    
-    
-# Helper for accurate GPU timings
-def _sync():
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-
-print('Loading data...')
-df_long = pd.read_csv(CFG.TRAIN_CSV)
-df_wide = df_long.pivot(index='image_path', columns='target_name', values='target').reset_index()
-assert df_wide['image_path'].is_unique, 'Leakage risk: duplicate image_path rows'
-
-# Merge metadata (Sampling_Date, State) for stratification
-if 'Sampling_Date' in df_long.columns and 'State' in df_long.columns:
-    print('Merging metadata for stratification...')
-    meta_df = df_long[['image_path', 'Sampling_Date', 'State']].drop_duplicates()
-    df_wide = df_wide.merge(meta_df, on='image_path', how='left')
-
-# Keep necessary columns
-df_wide = df_wide[['image_path', 'Sampling_Date', 'State'] + CFG.ALL_TARGET_COLS]
-print(f'{len(df_wide)} training images')
-
-# Use StratifiedGroupKFold
-sgkf = StratifiedGroupKFold(n_splits=CFG.N_FOLDS, shuffle=True, random_state=CFG.SEED)
-oof_true, oof_pred, fold_summary = [], [], []
-
-# Split based on groups (Sampling_Date) and stratification target (State)
-groups = df_wide['Sampling_Date']
-# df_wide['Sampling_Date&State'] = df_wide['Sampling_Date'] + '_' + df_wide['State']
-y_stratify = df_wide['State']
-
-models_list = [] # Removed to save memory
-
-for fold, (tr_idx, val_idx) in enumerate(sgkf.split(df_wide, y_stratify, groups=groups)):
-    if fold not in CFG.FOLDS_TO_TRAIN:
-        print(f'Skipping fold {fold} as per configuration.')
-        continue
-    print('\n' + '='*70)
-    print(f'FOLD {fold+1}/{CFG.N_FOLDS} | {len(tr_idx)} train / {len(val_idx)} val')
-    print('='*70)
-
-    # NOTE: avoid empty_cache/gc inside epoch loop; only between folds if you really want
-    _sync()
-    torch.cuda.empty_cache()
-    gc.collect()
-    
-    tr_df  = df_wide.iloc[tr_idx].reset_index(drop=True)
-    val_df = df_wide.iloc[val_idx].reset_index(drop=True)
-
-    # Quick train/val comparison for this fold
-    try:
-        compare_train_val(tr_df, val_df, CFG.ALL_TARGET_COLS, show_plots=True)
-    except Exception as e:
-        print('Warning: compare_train_val failed:', e)
-
-    tr_set = BiomassDataset(tr_df,  get_train_transforms(), CFG.TRAIN_IMAGE_DIR)
-    
-    # Create TTA loaders (keep TTAs as requested)
-    val_loaders = []
-    for mode in range(CFG.VAL_TTA_TIMES): # 0: orig, 1: hflip, 2: vflip, 3: rot90
-        val_set_tta = BiomassDataset(val_df, get_tta_transforms(mode), CFG.TRAIN_IMAGE_DIR)
-        val_loader_tta = DataLoader(val_set_tta, batch_size=CFG.BATCH_SIZE, shuffle=False,
-                                    num_workers=CFG.NUM_WORKERS, pin_memory=True)
-        val_loaders.append(val_loader_tta)
-
-    tr_loader  = DataLoader(tr_set, batch_size=CFG.BATCH_SIZE, shuffle=True,
-                            num_workers=CFG.NUM_WORKERS, pin_memory=True, drop_last=True)
-    
-    print('Building model...')
-    backbone_path = getattr(CFG, 'BACKBONE_PATH', None)
-    model = BiomassModel(CFG.MODEL_NAME, pretrained=CFG.PRETRAINED, backbone_path=backbone_path).to(CFG.DEVICE)
-
-    # Load pretrained fold weights if available (for resuming or fine-tuning)
-    # if getattr(CFG, 'PRETRAINED_DIR', None) and os.path.isdir(CFG.PRETRAINED_DIR):
-    #     pretrained_path = os.path.join(CFG.PRETRAINED_DIR, f'best_model_fold{fold}.pth')
-    #     if os.path.exists(pretrained_path):
-    #         try:
-    #             state = torch.load(pretrained_path, map_location='cpu')
-    #             # support raw state_dict or dict-with-keys
-    #             if isinstance(state, dict) and ('model_state_dict' in state or 'state_dict' in state):
-    #                 key = 'model_state_dict' if 'model_state_dict' in state else 'state_dict'
-    #                 sd = state[key]
-    #             else:
-    #                 sd = state
-    #             base_model.load_state_dict(sd, strict=False)
-    #             base_model.to(CFG.DEVICE)
-    #             print(f'  ✓ Loaded pretrained weights for fold {fold} from {pretrained_path}')
-    #         except Exception as e:
-    #             print(f'  ✗ Failed to load pretrained fold {fold}: {e}')
-    #     else:
-    #         print(f'  (No pretrained file for fold {fold} at {pretrained_path})')
-    # else:
-    #     print('  (No PRETRAINED_DIR configured or directory missing)')
-    
-    # Single GPU: DO NOT wrap in DataParallel
-    # model = nn.DataParallel(model)  # <-- removed
-
-    # Freeze/unfreeze backbone
-    set_backbone_requires_grad(model, False)
-
-    optimizer = build_optimizer(model)
-    scheduler = build_scheduler(optimizer)
-
-    # EMA on the real model
-    ema = ModelEmaV2(model, decay=CFG.EMA_DECAY)
-    
-    best_global_r2 = -np.inf
-    best_avg_r2 = -np.inf
-    patience = 0
-    best_fold_preds = None
-    best_fold_true = None
-    
-    # Define save path
-    if not os.path.exists(CFG.MODEL_DIR):
-        os.makedirs(CFG.MODEL_DIR)
-    save_path = os.path.join(CFG.MODEL_DIR, f'best_model_fold{fold}.pth')
-    
-    for epoch in range(1, CFG.EPOCHS + 1):
-        if epoch == CFG.FREEZE_EPOCHS + 1:
-            patience = 0
-            set_backbone_requires_grad(model, True)
-            print(f'Epoch {epoch}: backbone unfrozen')
-        
-        # ---- Train timing ----
-        # _sync()
-        # t0 = time.perf_counter()
-        tr_loss = train_epoch(model, tr_loader, optimizer, scheduler, CFG.DEVICE, ema)
-        # _sync()
-        # t1 = time.perf_counter()
-
-        # choose eval model (EMA weights)
-        eval_model = ema.module if ema is not None else model
-        
-        # ---- Val timing (TTA) ----
-        # _sync()
-        # t2 = time.perf_counter()
-        val_loss, global_r2, avg_r2, per_r2, preds_fold, true_fold = valid_epoch_tta(eval_model, val_loaders, CFG.DEVICE)
-        # _sync()
-        # t3 = time.perf_counter()
-
-        # time_tr = t1 - t0
-        # time_val = t3 - t2
-        # time_ep = t3 - t0
-        
-        per_r2_str = ' | '.join([f'{CFG.ALL_TARGET_COLS[i][:5]}: {r2:.3f}' for i, r2 in enumerate(per_r2)])
-        lrs = [pg['lr'] for pg in optimizer.param_groups]
-        print(f'Fold {fold} | Epoch {epoch:02d} | TLoss {tr_loss:.5f} | VLoss {val_loss:.5f} |avgR2 {avg_r2:.4f}| GlobalR² {global_r2:.4f} {"[BEST]" if global_r2 > best_global_r2 else ""}')
-        print(f'  → {per_r2_str}')
-        
-        if global_r2 > best_global_r2:
-            best_global_r2 = global_r2
-            best_avg_r2 = avg_r2
-            
-            # Save the EMA weights (best state) to disk immediately
-            # Clone to CPU to avoid memory issues
-            # NOTE: safest is to save state_dict tensors as-is; this is typically fine on DGX.
-            # best_state = {k: v.cpu().clone() for k, v in eval_model.state_dict().items()}
-            torch.save(eval_model.state_dict(), save_path)
-            print(f'  → SAVED EMA weights to {save_path} (GlobalR²: {best_global_r2:.4f})')
-            # del best_state # Free memory
-            
-            patience = 0
-            best_fold_preds = preds_fold
-            best_fold_true = true_fold
-        else:
-            patience += 1
-            if patience >= CFG.PATIENCE:
-                print(f'  → EARLY STOP (no improvement in {CFG.PATIENCE} epochs)')
-                break
-                
-        # keep memory tidy but avoid heavy cache/gc churn
-        del preds_fold, true_fold
-        # torch.cuda.empty_cache()
-        # gc.collect()
-    
-    if best_fold_preds is not None:
-        oof_true.append(best_fold_true)
-        oof_pred.append(best_fold_preds)
-        fold_summary.append({'fold': fold, 'global_r2': best_global_r2, 'avg_r2': best_avg_r2})
-    
-    # Cleanup for this fold
-    del model, tr_loader, val_loaders, optimizer, scheduler, ema, eval_model
-    _sync()
-    torch.cuda.empty_cache()
-    gc.collect()
-
-if oof_true:
-    oof_true_arr = np.concatenate(oof_true, axis=0)
-    oof_pred_arr = np.concatenate(oof_pred, axis=0)
-    oof_global_r2, oof_avg_r2, oof_per_r2 = weighted_r2_score_global(oof_true_arr, oof_pred_arr)
-
-    print('\nTraining complete! Models saved in:', CFG.MODEL_DIR)
-    print('Fold summary:')
-    for fs in fold_summary:
-        print(f"  Fold {fs['fold']}: Global R² = {fs['global_r2']:.4f}, Avg R² = {fs.get('avg_r2', float('nan')):.4f}")
-    print(f'OOF Global Weighted R²: {oof_global_r2:.4f} | OOF Avg Target R²: {oof_avg_r2:.4f}')
-    print('OOF Per-target:', dict(zip(CFG.ALL_TARGET_COLS, [f"{r:.4f}" for r in oof_per_r2])))
-else:
-    print('No OOF predictions collected.')
-
-############################################################
-# 7️⃣.Submit
-############################################################
-
-# ===============================================================
 # 4. DEFINE TTA TRANSFORMS
 # ===============================================================
 def get_tta_transforms(num_transforms):
@@ -1082,7 +741,6 @@ def clean_image(img):
         img = cv2.inpaint(img, mask, 3, cv2.INPAINT_TELEA)
     return img
 
-
 class BiomassTestDataset(Dataset):
     """
     Test dataset for biomass images.
@@ -1124,6 +782,7 @@ print("✓ Test dataset class defined")
 # ===============================================================
 # 8. RUN INFERENCE WITH TTA (UPDATED to honor CFG.FOLDS_TO_TRAIN)
 # ===============================================================
+
 @torch.no_grad()
 def predict_with_tta(model, left_np, right_np, tta_transforms):
     """
@@ -1206,7 +865,7 @@ def run_inference():
     for fold in folds_to_use:
         print(f"\nProcessing Fold {fold}...")
         # Load model for this fold
-        model_dir = CFG.MODEL_DIR_012 if fold in [0,1,2] else CFG.MODEL_DIR_34
+        model_dir = CFG.MODEL_DIR
         backbone_path = getattr(CFG, 'BACKBONE_PATH', None)
         model = BiomassModel(CFG.MODEL_NAME, pretrained=False, backbone_path=backbone_path)
         
@@ -1255,7 +914,7 @@ def run_inference():
     return final_predictions, filenames
 
 # ===============================================================
-# 9️⃣. POST-PROCESS PREDICTIONS
+# 9. POST-PROCESS PREDICTIONS
 # ===============================================================
 def postprocess_predictions(preds_direct):
     """
@@ -1290,14 +949,15 @@ def postprocess_predictions(preds_direct):
     print(f"\nPrediction statistics:")
     for i, col in enumerate(CFG.ALL_TARGET_COLS):
         print(f"  {col:15s}: mean={preds_all[:, i].mean():.2f}, "
-                            f"std={preds_all[:, i].std():.2f}, "
-                            f"min={preds_all[:, i].min():.2f}, "
-                            f"max={preds_all[:, i].max():.2f}")
+              f"std={preds_all[:, i].std():.2f}, "
+              f"min={preds_all[:, i].min():.2f}, "
+              f"max={preds_all[:, i].max():.2f}")
     
     return preds_all
 
+
 # ===============================================================
-# 🔟. CREATE SUBMISSION FILE (FIXED)
+# 10. CREATE SUBMISSION FILE (FIXED)
 # ===============================================================
 def create_submission(predictions, filenames):
     """
@@ -1383,7 +1043,7 @@ def create_submission(predictions, filenames):
     submission = submission.sort_values('sample_id').reset_index(drop=True)
     
     # Step 9: Save to CSV
-    output_path = os.path.join(CFG.SUBMISSION_DIR, 'submission.csv')
+    output_path = os.path.join(CFG.SUBMISSION_DIR, 'submission70.csv')
     submission.to_csv(output_path, index=False)
     
     print(f"\n✓ Submission file saved: {output_path}")
@@ -1417,7 +1077,5 @@ def create_submission(predictions, filenames):
 # Run inference
 if CFG.CREATE_SUBMISSION:
     predictions_direct, test_filenames = run_inference()
-    # 后处理，将3个预测值处理为5个
     predictions_all = postprocess_predictions(predictions_direct)
     submission_df = create_submission(predictions_all, test_filenames)
-    
